@@ -1,0 +1,1132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sports Betting Command Center</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --bg-dark: #0a0e27;
+            --bg-darker: #050810;
+            --bg-card: #0f1535;
+            --text-primary: #e4e6eb;
+            --text-secondary: #a0a5b8;
+            --accent-green: #00d084;
+            --accent-red: #ff4757;
+            --accent-yellow: #ffa502;
+            --accent-blue: #3b82f6;
+            --border-color: #1a2f5f;
+            --shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+        }
+
+        body {
+            background: linear-gradient(135deg, var(--bg-darker) 0%, var(--bg-dark) 100%);
+            color: var(--text-primary);
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            overflow-x: hidden;
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 1600px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        /* Header */
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 30px;
+            padding: 20px;
+            background: linear-gradient(135deg, rgba(0, 208, 132, 0.1) 0%, rgba(59, 130, 246, 0.1) 100%);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            backdrop-filter: blur(10px);
+        }
+
+        .header h1 {
+            font-size: 2.5em;
+            font-weight: 700;
+            color: var(--accent-green);
+            text-shadow: 0 0 10px rgba(0, 208, 132, 0.3);
+        }
+
+        .header .date {
+            font-size: 1.1em;
+            color: var(--text-secondary);
+        }
+
+        /* Tabs */
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 30px;
+            border-bottom: 2px solid var(--border-color);
+            padding-bottom: 15px;
+        }
+
+        .tab-btn {
+            padding: 10px 20px;
+            background: transparent;
+            border: none;
+            color: var(--text-secondary);
+            font-size: 1em;
+            cursor: pointer;
+            position: relative;
+            transition: color 0.3s;
+            font-weight: 600;
+        }
+
+        .tab-btn:hover {
+            color: var(--accent-green);
+        }
+
+        .tab-btn.active {
+            color: var(--accent-green);
+        }
+
+        .tab-btn.active::after {
+            content: '';
+            position: absolute;
+            bottom: -15px;
+            left: 0;
+            right: 0;
+            height: 2px;
+            background: var(--accent-green);
+            box-shadow: 0 0 10px rgba(0, 208, 132, 0.5);
+        }
+
+        /* Bankroll Summary */
+        .bankroll-summary {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .summary-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 20px;
+            backdrop-filter: blur(10px);
+            box-shadow: var(--shadow);
+            transition: transform 0.3s, border-color 0.3s;
+        }
+
+        .summary-card:hover {
+            transform: translateY(-5px);
+            border-color: var(--accent-green);
+        }
+
+        .summary-card .label {
+            color: var(--text-secondary);
+            font-size: 0.9em;
+            margin-bottom: 8px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .summary-card .value {
+            font-size: 2em;
+            font-weight: 700;
+            margin-bottom: 10px;
+        }
+
+        .summary-card.profit .value {
+            color: var(--accent-green);
+        }
+
+        .summary-card.loss .value {
+            color: var(--accent-red);
+        }
+
+        .summary-card.neutral .value {
+            color: var(--accent-blue);
+        }
+
+        .progress-bar {
+            width: 100%;
+            height: 8px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 4px;
+            overflow: hidden;
+            margin-top: 10px;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, var(--accent-green), var(--accent-blue));
+            border-radius: 4px;
+            box-shadow: 0 0 10px rgba(0, 208, 132, 0.5);
+            transition: width 0.3s;
+        }
+
+        .stat-row {
+            display: flex;
+            justify-content: space-between;
+            margin-top: 8px;
+            font-size: 0.9em;
+            color: var(--text-secondary);
+        }
+
+        /* Today's Picks Section */
+        .today-picks {
+            margin-bottom: 30px;
+        }
+
+        .section-title {
+            font-size: 1.5em;
+            font-weight: 700;
+            margin-bottom: 15px;
+            color: var(--accent-green);
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid var(--border-color);
+        }
+
+        .picks-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .pick-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 20px;
+            backdrop-filter: blur(10px);
+            box-shadow: var(--shadow);
+            transition: all 0.3s;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .pick-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 4px;
+            background: linear-gradient(90deg, var(--accent-green), var(--accent-blue));
+        }
+
+        .pick-card:hover {
+            transform: translateY(-8px);
+            border-color: var(--accent-green);
+            box-shadow: 0 12px 48px rgba(0, 208, 132, 0.2);
+        }
+
+        .pick-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: start;
+            margin-bottom: 15px;
+        }
+
+        .sport-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            background: rgba(59, 130, 246, 0.2);
+            border: 1px solid var(--accent-blue);
+            border-radius: 20px;
+            font-size: 0.8em;
+            font-weight: 600;
+            color: var(--accent-blue);
+        }
+
+        .sport-badge.nba {
+            background: rgba(255, 165, 2, 0.2);
+            border-color: var(--accent-yellow);
+            color: var(--accent-yellow);
+        }
+
+        .sport-badge.mlb {
+            background: rgba(255, 71, 87, 0.2);
+            border-color: var(--accent-red);
+            color: var(--accent-red);
+        }
+
+        .sport-badge.soccer {
+            background: rgba(0, 208, 132, 0.2);
+            border-color: var(--accent-green);
+            color: var(--accent-green);
+        }
+
+        .risk-badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 0.75em;
+            font-weight: 700;
+            text-transform: uppercase;
+        }
+
+        .risk-badge.high {
+            background: rgba(255, 71, 87, 0.3);
+            color: var(--accent-red);
+        }
+
+        .risk-badge.medium {
+            background: rgba(255, 165, 2, 0.3);
+            color: var(--accent-yellow);
+        }
+
+        .risk-badge.low {
+            background: rgba(0, 208, 132, 0.3);
+            color: var(--accent-green);
+        }
+
+        .pick-event {
+            font-size: 0.9em;
+            color: var(--text-secondary);
+            margin-bottom: 10px;
+        }
+
+        .pick-pick {
+            font-size: 1.3em;
+            font-weight: 700;
+            color: var(--text-primary);
+            margin-bottom: 15px;
+        }
+
+        .pick-details {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            font-size: 0.85em;
+            margin-bottom: 15px;
+        }
+
+        .pick-detail-item {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .pick-detail-label {
+            color: var(--text-secondary);
+            margin-bottom: 3px;
+            text-transform: uppercase;
+            font-size: 0.75em;
+            letter-spacing: 0.5px;
+        }
+
+        .pick-detail-value {
+            color: var(--text-primary);
+            font-weight: 600;
+        }
+
+        .confidence-stars {
+            display: flex;
+            gap: 4px;
+            margin-top: 3px;
+        }
+
+        .star {
+            width: 16px;
+            height: 16px;
+            background: rgba(255, 165, 2, 0.3);
+            border-radius: 2px;
+            border: 1px solid var(--accent-yellow);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.7em;
+            color: var(--accent-yellow);
+        }
+
+        .star.filled {
+            background: var(--accent-yellow);
+            color: var(--bg-dark);
+        }
+
+        /* Bet Tracker Table */
+        .bet-tracker {
+            margin-bottom: 30px;
+        }
+
+        .table-wrapper {
+            overflow-x: auto;
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            backdrop-filter: blur(10px);
+            box-shadow: var(--shadow);
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.9em;
+        }
+
+        thead {
+            background: rgba(0, 208, 132, 0.05);
+            border-bottom: 2px solid var(--border-color);
+        }
+
+        th {
+            padding: 15px;
+            text-align: left;
+            color: var(--accent-green);
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            cursor: pointer;
+            user-select: none;
+            border-right: 1px solid var(--border-color);
+        }
+
+        th:hover {
+            background: rgba(0, 208, 132, 0.1);
+        }
+
+        th::after {
+            content: ' ⇅';
+            margin-left: 5px;
+            opacity: 0.5;
+        }
+
+        td {
+            padding: 15px;
+            border-bottom: 1px solid var(--border-color);
+            border-right: 1px solid var(--border-color);
+        }
+
+        tbody tr {
+            transition: background 0.3s;
+        }
+
+        tbody tr:hover {
+            background: rgba(0, 208, 132, 0.05);
+        }
+
+        tbody tr.win {
+            background: rgba(0, 208, 132, 0.08);
+            border-left: 3px solid var(--accent-green);
+        }
+
+        tbody tr.loss {
+            background: rgba(255, 71, 87, 0.08);
+            border-left: 3px solid var(--accent-red);
+        }
+
+        tbody tr.pending {
+            background: rgba(255, 165, 2, 0.08);
+            border-left: 3px solid var(--accent-yellow);
+        }
+
+        .result-badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-weight: 600;
+            font-size: 0.85em;
+            text-transform: uppercase;
+        }
+
+        .result-badge.win {
+            background: rgba(0, 208, 132, 0.3);
+            color: var(--accent-green);
+        }
+
+        .result-badge.loss {
+            background: rgba(255, 71, 87, 0.3);
+            color: var(--accent-red);
+        }
+
+        .result-badge.pending {
+            background: rgba(255, 165, 2, 0.3);
+            color: var(--accent-yellow);
+        }
+
+        .pl-positive {
+            color: var(--accent-green);
+            font-weight: 700;
+        }
+
+        .pl-negative {
+            color: var(--accent-red);
+            font-weight: 700;
+        }
+
+        /* Charts Section */
+        .charts-section {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .chart-container {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 20px;
+            backdrop-filter: blur(10px);
+            box-shadow: var(--shadow);
+        }
+
+        .chart-title {
+            font-size: 1.1em;
+            font-weight: 700;
+            margin-bottom: 15px;
+            color: var(--accent-green);
+        }
+
+        .chart-canvas {
+            position: relative;
+            height: 300px;
+        }
+
+        /* Kelly Calculator */
+        .kelly-calculator {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 20px;
+            backdrop-filter: blur(10px);
+            box-shadow: var(--shadow);
+            max-width: 500px;
+        }
+
+        .kelly-form {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+
+        .form-group {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .form-label {
+            color: var(--text-secondary);
+            font-size: 0.9em;
+            margin-bottom: 5px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .form-input {
+            padding: 12px;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            color: var(--text-primary);
+            font-size: 1em;
+            transition: border-color 0.3s;
+        }
+
+        .form-input:focus {
+            outline: none;
+            border-color: var(--accent-green);
+            box-shadow: 0 0 10px rgba(0, 208, 132, 0.2);
+        }
+
+        .kelly-results {
+            background: rgba(0, 208, 132, 0.05);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 15px;
+            margin-top: 15px;
+        }
+
+        .kelly-result-row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 10px;
+            font-size: 0.9em;
+        }
+
+        .kelly-result-row:last-child {
+            margin-bottom: 0;
+            border-top: 1px solid var(--border-color);
+            padding-top: 10px;
+            margin-top: 10px;
+        }
+
+        .kelly-result-label {
+            color: var(--text-secondary);
+        }
+
+        .kelly-result-value {
+            color: var(--accent-green);
+            font-weight: 700;
+            font-family: 'Courier New', monospace;
+        }
+
+        .btn {
+            padding: 12px 20px;
+            background: linear-gradient(135deg, var(--accent-green), var(--accent-blue));
+            border: none;
+            border-radius: 8px;
+            color: var(--bg-dark);
+            font-weight: 700;
+            cursor: pointer;
+            transition: all 0.3s;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            font-size: 0.9em;
+        }
+
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 24px rgba(0, 208, 132, 0.3);
+        }
+
+        /* Responsive */
+        @media (max-width: 1200px) {
+            .charts-section {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        @media (max-width: 768px) {
+            .header {
+                flex-direction: column;
+                gap: 15px;
+                align-items: flex-start;
+            }
+
+            .header h1 {
+                font-size: 1.8em;
+            }
+
+            .bankroll-summary {
+                grid-template-columns: 1fr;
+            }
+
+            .picks-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .chart-canvas {
+                height: 250px;
+            }
+
+            table {
+                font-size: 0.75em;
+            }
+
+            th, td {
+                padding: 10px;
+            }
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 40px;
+            color: var(--text-secondary);
+        }
+
+        .empty-state-icon {
+            font-size: 3em;
+            margin-bottom: 15px;
+            opacity: 0.5;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <h1>🎯 Sports Betting Command Center</h1>
+            <div class="date" id="currentDate"></div>
+        </div>
+
+        <!-- Sport Tabs -->
+        <div class="tabs">
+            <button class="tab-btn active" data-sport="all">All Sports</button>
+            <button class="tab-btn" data-sport="nba">NBA</button>
+            <button class="tab-btn" data-sport="mlb">MLB</button>
+            <button class="tab-btn" data-sport="soccer">Soccer</button>
+        </div>
+
+        <!-- Bankroll Summary -->
+        <div class="bankroll-summary">
+            <div class="summary-card neutral">
+                <div class="label">Current Bankroll</div>
+                <div class="value" id="currentBankroll">$5,250.00</div>
+                <div class="stat-row">
+                    <span>Starting: $5,000</span>
+                    <span>Δ: +$250</span>
+                </div>
+            </div>
+
+            <div class="summary-card profit">
+                <div class="label">Weekly P&L</div>
+                <div class="value" id="weeklyPnL">+$380.00</div>
+                <div class="progress-bar">
+                    <div class="progress-fill" id="weeklyProgress" style="width: 76%"></div>
+                </div>
+                <div class="stat-row">
+                    <span>Target: $500</span>
+                    <span>76% of goal</span>
+                </div>
+            </div>
+
+            <div class="summary-card neutral">
+                <div class="label">Win Rate</div>
+                <div class="value" id="winRate">58.3%</div>
+                <div class="stat-row">
+                    <span>14W - 10L</span>
+                    <span id="roi">ROI: 12.5%</span>
+                </div>
+            </div>
+
+            <div class="summary-card neutral">
+                <div class="label">This Week's Bets</div>
+                <div class="value" id="weeklyBets">12</div>
+                <div class="stat-row">
+                    <span>9 Won, 3 Lost</span>
+                    <span>Avg: +$42/bet</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Today's Picks -->
+        <div class="today-picks">
+            <div class="section-title">Today's Recommended Picks</div>
+            <div class="picks-grid" id="picksGrid">
+                <!-- Populated by JavaScript -->
+            </div>
+        </div>
+
+        <!-- Bet Tracker -->
+        <div class="bet-tracker">
+            <div class="section-title">Bet Tracker</div>
+            <div class="table-wrapper">
+                <table id="betTable">
+                    <thead>
+                        <tr>
+                            <th onclick="sortTable('date')">Date</th>
+                            <th onclick="sortTable('sport')">Sport</th>
+                            <th onclick="sortTable('event')">Event</th>
+                            <th onclick="sortTable('pick')">Pick</th>
+                            <th onclick="sortTable('odds')">Odds</th>
+                            <th onclick="sortTable('stake')">Stake</th>
+                            <th onclick="sortTable('result')">Result</th>
+                            <th onclick="sortTable('pnl')">P&L</th>
+                        </tr>
+                    </thead>
+                    <tbody id="betTableBody">
+                        <!-- Populated by JavaScript -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Charts -->
+        <div class="charts-section">
+            <div class="chart-container">
+                <div class="chart-title">Bankroll Progression</div>
+                <div class="chart-canvas">
+                    <canvas id="bankrollChart"></canvas>
+                </div>
+            </div>
+
+            <div class="chart-container">
+                <div class="chart-title">Win Rate by Sport</div>
+                <div class="chart-canvas">
+                    <canvas id="winRateChart"></canvas>
+                </div>
+            </div>
+
+            <div class="chart-container">
+                <div class="chart-title">Weekly P&L</div>
+                <div class="chart-canvas">
+                    <canvas id="weeklyChart"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <!-- Kelly Calculator -->
+        <div class="kelly-calculator">
+            <div class="section-title">Kelly Criterion Calculator</div>
+            <div class="kelly-form">
+                <div class="form-group">
+                    <label class="form-label">Win Probability (%)</label>
+                    <input type="number" class="form-input" id="kellyProb" placeholder="55" min="1" max="99" value="55">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Decimal Odds</label>
+                    <input type="number" class="form-input" id="kellyOdds" placeholder="2.0" step="0.01" min="1.01" value="2.0">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Bankroll ($)</label>
+                    <input type="number" class="form-input" id="kellyBankroll" placeholder="5000" value="5250">
+                </div>
+                <button class="btn" onclick="calculateKelly()">Calculate</button>
+                <div class="kelly-results" id="kellyResults">
+                    <div class="kelly-result-row">
+                        <span class="kelly-result-label">Full Kelly</span>
+                        <span class="kelly-result-value" id="fullKelly">-</span>
+                    </div>
+                    <div class="kelly-result-row">
+                        <span class="kelly-result-label">Half Kelly</span>
+                        <span class="kelly-result-value" id="halfKelly">-</span>
+                    </div>
+                    <div class="kelly-result-row">
+                        <span class="kelly-result-label">Quarter Kelly</span>
+                        <span class="kelly-result-value" id="quarterKelly">-</span>
+                    </div>
+                    <div class="kelly-result-row">
+                        <span class="kelly-result-label">Recommended Max</span>
+                        <span class="kelly-result-value" id="recommendedKelly">-</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Demo Data
+        const demoData = {
+            picks: [
+                {
+                    id: 1,
+                    sport: 'nba',
+                    event: 'Lakers vs Warriors',
+                    pick: 'Over 215.5',
+                    confidence: 8,
+                    ev: '+2.3%',
+                    recommendedSize: '$125',
+                    risk: 'low',
+                    timestamp: new Date()
+                },
+                {
+                    id: 2,
+                    sport: 'mlb',
+                    event: 'Yankees vs Red Sox',
+                    pick: 'Yankees ML',
+                    confidence: 7,
+                    ev: '+1.8%',
+                    recommendedSize: '$95',
+                    risk: 'medium',
+                    timestamp: new Date()
+                },
+                {
+                    id: 3,
+                    sport: 'soccer',
+                    event: 'Man City vs Liverpool',
+                    pick: 'Man City Win',
+                    confidence: 9,
+                    ev: '+3.1%',
+                    recommendedSize: '$150',
+                    risk: 'low',
+                    timestamp: new Date()
+                },
+                {
+                    id: 4,
+                    sport: 'nba',
+                    event: 'Celtics vs Heat',
+                    pick: 'Under 203.5',
+                    confidence: 6,
+                    ev: '+0.9%',
+                    recommendedSize: '$65',
+                    risk: 'medium',
+                    timestamp: new Date()
+                },
+                {
+                    id: 5,
+                    sport: 'soccer',
+                    event: 'Bayern Munich vs PSG',
+                    pick: 'Both Teams Score',
+                    confidence: 7,
+                    ev: '+2.1%',
+                    recommendedSize: '$110',
+                    risk: 'low',
+                    timestamp: new Date()
+                }
+            ],
+            bets: [
+                { date: '2026-03-22', sport: 'NBA', event: 'Suns vs Nuggets', pick: 'Over 218', odds: 1.91, stake: 150, result: 'Win', pnl: 136.50 },
+                { date: '2026-03-22', sport: 'Soccer', event: 'City vs United', pick: 'City ML', odds: 1.72, stake: 200, result: 'Win', pnl: 144 },
+                { date: '2026-03-21', sport: 'MLB', event: 'Mets vs Braves', pick: 'Braves ML', odds: 1.85, stake: 100, result: 'Loss', pnl: -100 },
+                { date: '2026-03-21', sport: 'NBA', event: 'Celtics vs Wizards', pick: 'Celtics -8.5', odds: 1.95, stake: 180, result: 'Win', pnl: 171 },
+                { date: '2026-03-20', sport: 'Soccer', event: 'Liverpool vs Chelsea', pick: 'Over 2.5', odds: 1.88, stake: 120, result: 'Win', pnl: 105.60 },
+                { date: '2026-03-20', sport: 'NBA', event: 'Lakers vs Clippers', pick: 'Under 219', odds: 2.05, stake: 140, result: 'Win', pnl: 147 },
+                { date: '2026-03-19', sport: 'MLB', event: 'Giants vs Padres', pick: 'Over 7.5', odds: 1.92, stake: 95, result: 'Loss', pnl: -95 },
+                { date: '2026-03-19', sport: 'Soccer', event: 'PSG vs Nantes', pick: 'PSG ML', odds: 1.45, stake: 250, result: 'Win', pnl: 112.50 },
+                { date: '2026-03-18', sport: 'NBA', event: 'Heat vs Raptors', pick: 'Heat ML', odds: 1.78, stake: 165, result: 'Win', pnl: 128.70 },
+                { date: '2026-03-18', sport: 'Soccer', event: 'Arsenal vs Spurs', pick: 'Under 2.5', odds: 1.95, stake: 135, result: 'Pending', pnl: 0 },
+                { date: '2026-03-17', sport: 'NBA', event: 'Nets vs 76ers', pick: 'Over 217.5', odds: 2.08, stake: 125, result: 'Loss', pnl: -125 },
+                { date: '2026-03-17', sport: 'MLB', event: 'Yankees vs Orioles', pick: 'Yankees -1.5', odds: 1.88, stake: 110, result: 'Win', pnl: 96.80 },
+                { date: '2026-03-16', sport: 'Soccer', event: 'Real Madrid vs Sevilla', pick: 'Madrid ML', odds: 1.52, stake: 200, result: 'Win', pnl: 104 },
+                { date: '2026-03-16', sport: 'NBA', event: 'Mavericks vs Pelicans', pick: 'Mavericks -6', odds: 1.98, stake: 160, result: 'Win', pnl: 156.80 },
+                { date: '2026-03-15', sport: 'Soccer', event: 'Inter Milan vs Lazio', pick: 'Inter ML', odds: 1.68, stake: 180, result: 'Loss', pnl: -180 },
+                { date: '2026-03-15', sport: 'NBA', event: 'Grizzlies vs Timberwolves', pick: 'Under 212', odds: 1.89, stake: 140, result: 'Win', pnl: 124.60 },
+                { date: '2026-03-14', sport: 'MLB', event: 'Astros vs Rangers', pick: 'Astros ML', odds: 1.91, stake: 130, result: 'Win', pnl: 118.30 },
+                { date: '2026-03-14', sport: 'Soccer', event: 'Barcelona vs Atletico', pick: 'Over 2.5', odds: 1.75, stake: 160, result: 'Win', pnl: 120 },
+                { date: '2026-03-13', sport: 'NBA', event: 'Kings vs Rockets', pick: 'Kings -3', odds: 2.01, stake: 155, result: 'Win', pnl: 156.55 },
+                { date: '2026-03-13', sport: 'Soccer', event: 'Dortmund vs Frankfurt', pick: 'Dortmund ML', odds: 1.62, stake: 190, result: 'Pending', pnl: 0 }
+            ]
+        };
+
+        let currentFilter = 'all';
+        let sortColumn = 'date';
+        let sortAscending = false;
+
+        // Initialize
+        function init() {
+            updateDate();
+            renderPicks();
+            renderBets();
+            setupCharts();
+            setupTabListeners();
+        }
+
+        // Update date
+        function updateDate() {
+            const options = { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' };
+            const today = new Date().toLocaleDateString('en-US', options);
+            document.getElementById('currentDate').textContent = today;
+        }
+
+        // Tab listeners
+        function setupTabListeners() {
+            document.querySelectorAll('.tab-btn').forEach(btn => {
+                btn.addEventListener('click', function() {
+                    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+                    this.classList.add('active');
+                    currentFilter = this.dataset.sport;
+                    renderPicks();
+                    renderBets();
+                });
+            });
+        }
+
+        // Render picks
+        function renderPicks() {
+            const filtered = currentFilter === 'all'
+                ? demoData.picks
+                : demoData.picks.filter(p => p.sport === currentFilter);
+
+            const html = filtered.map(pick => `
+                <div class="pick-card">
+                    <div class="pick-header">
+                        <span class="sport-badge ${pick.sport}">${pick.sport.toUpperCase()}</span>
+                        <span class="risk-badge ${pick.risk}">${pick.risk} Risk</span>
+                    </div>
+                    <div class="pick-event">${pick.event}</div>
+                    <div class="pick-pick">${pick.pick}</div>
+                    <div class="pick-details">
+                        <div class="pick-detail-item">
+                            <div class="pick-detail-label">Confidence</div>
+                            <div class="confidence-stars">
+                                ${Array.from({length: 10}).map((_, i) =>
+                                    `<div class="star ${i < pick.confidence ? 'filled' : ''}">★</div>`
+                                ).join('')}
+                            </div>
+                        </div>
+                        <div class="pick-detail-item">
+                            <div class="pick-detail-label">Expected Value</div>
+                            <div class="pick-detail-value" style="color: var(--accent-green);">${pick.ev}</div>
+                        </div>
+                        <div class="pick-detail-item">
+                            <div class="pick-detail-label">Bet Size</div>
+                            <div class="pick-detail-value">${pick.recommendedSize}</div>
+                        </div>
+                    </div>
+                </div>
+            `).join('');
+
+            document.getElementById('picksGrid').innerHTML = html || '<div class="empty-state"><div class="empty-state-icon">📭</div>No picks for this sport today</div>';
+        }
+
+        // Render bets
+        function renderBets() {
+            let filtered = currentFilter === 'all'
+                ? demoData.bets
+                : demoData.bets.filter(b => b.sport === currentFilter);
+
+            // Sort
+            filtered = filtered.sort((a, b) => {
+                let aVal = a[sortColumn];
+                let bVal = b[sortColumn];
+
+                if (typeof aVal === 'number') {
+                    return sortAscending ? aVal - bVal : bVal - aVal;
+                }
+
+                if (sortAscending) {
+                    return aVal < bVal ? -1 : aVal > bVal ? 1 : 0;
+                } else {
+                    return aVal > bVal ? -1 : aVal < bVal ? 1 : 0;
+                }
+            });
+
+            const html = filtered.map(bet => `
+                <tr class="${bet.result.toLowerCase()}">
+                    <td>${bet.date}</td>
+                    <td>${bet.sport}</td>
+                    <td>${bet.event}</td>
+                    <td>${bet.pick}</td>
+                    <td>${bet.odds.toFixed(2)}</td>
+                    <td>$${bet.stake}</td>
+                    <td><span class="result-badge ${bet.result.toLowerCase()}">${bet.result}</span></td>
+                    <td class="${bet.pnl > 0 ? 'pl-positive' : 'pl-negative'}">
+                        ${bet.pnl > 0 ? '+' : ''}$${Math.abs(bet.pnl).toFixed(2)}
+                    </td>
+                </tr>
+            `).join('');
+
+            document.getElementById('betTableBody').innerHTML = html;
+        }
+
+        function sortTable(column) {
+            if (sortColumn === column) {
+                sortAscending = !sortAscending;
+            } else {
+                sortColumn = column;
+                sortAscending = true;
+            }
+            renderBets();
+        }
+
+        // Setup charts
+        function setupCharts() {
+            // Bankroll chart
+            const bankrollCtx = document.getElementById('bankrollChart').getContext('2d');
+            new Chart(bankrollCtx, {
+                type: 'line',
+                data: {
+                    labels: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'],
+                    datasets: [{
+                        label: 'Bankroll',
+                        data: [5000, 5120, 4890, 5340, 5180, 5100, 5250],
+                        borderColor: '#00d084',
+                        backgroundColor: 'rgba(0, 208, 132, 0.1)',
+                        borderWidth: 2,
+                        fill: true,
+                        tension: 0.4,
+                        pointBackgroundColor: '#00d084',
+                        pointBorderColor: '#fff',
+                        pointRadius: 5,
+                        pointHoverRadius: 7
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: { legend: { display: false } },
+                    scales: {
+                        y: {
+                            beginAtZero: false,
+                            grid: { color: 'rgba(26, 47, 95, 0.3)' },
+                            ticks: { color: '#a0a5b8' }
+                        },
+                        x: { grid: { display: false }, ticks: { color: '#a0a5b8' } }
+                    }
+                }
+            });
+
+            // Win rate by sport
+            const winRateCtx = document.getElementById('winRateChart').getContext('2d');
+            new Chart(winRateCtx, {
+                type: 'bar',
+                data: {
+                    labels: ['NBA', 'MLB', 'Soccer'],
+                    datasets: [{
+                        label: 'Win Rate %',
+                        data: [61.5, 50, 62.5],
+                        backgroundColor: ['#ffa502', '#ff4757', '#00d084'],
+                        borderRadius: 8,
+                        borderSkipped: false
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: { legend: { display: false } },
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            max: 100,
+                            grid: { color: 'rgba(26, 47, 95, 0.3)' },
+                            ticks: { color: '#a0a5b8', callback: function(v) { return v + '%'; } }
+                        },
+                        x: { grid: { display: false }, ticks: { color: '#a0a5b8' } }
+                    }
+                }
+            });
+
+            // Weekly P&L
+            const weeklyCtx = document.getElementById('weeklyChart').getContext('2d');
+            new Chart(weeklyCtx, {
+                type: 'bar',
+                data: {
+                    labels: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'],
+                    datasets: [{
+                        label: 'Daily P&L',
+                        data: [120, -230, 450, -160, 80, -80, 200],
+                        backgroundColor: function(context) {
+                            return context.raw > 0 ? '#00d084' : '#ff4757';
+                        },
+                        borderRadius: 8,
+                        borderSkipped: false
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: { legend: { display: false } },
+                    scales: {
+                        y: {
+                            grid: { color: 'rgba(26, 47, 95, 0.3)' },
+                            ticks: { color: '#a0a5b8', callback: function(v) { return '$' + v; } }
+                        },
+                        x: { grid: { display: false }, ticks: { color: '#a0a5b8' } }
+                    }
+                }
+            });
+        }
+
+        // Kelly calculator
+        function calculateKelly() {
+            const prob = parseFloat(document.getElementById('kellyProb').value) / 100;
+            const odds = parseFloat(document.getElementById('kellyOdds').value);
+            const bankroll = parseFloat(document.getElementById('kellyBankroll').value);
+
+            if (prob <= 0 || prob >= 1 || odds <= 1 || bankroll <= 0) {
+                alert('Please enter valid values');
+                return;
+            }
+
+            const b = odds - 1;
+            const p = prob;
+            const q = 1 - prob;
+
+            const kellyPct = (p * b - q) / b;
+            const fullKelly = Math.max(0, kellyPct) * bankroll;
+            const halfKelly = fullKelly * 0.5;
+            const quarterKelly = fullKelly * 0.25;
+            const recommended = Math.min(fullKelly, bankroll * 0.05);
+
+            document.getElementById('fullKelly').textContent = `$${fullKelly.toFixed(2)}`;
+            document.getElementById('halfKelly').textContent = `$${halfKelly.toFixed(2)}`;
+            document.getElementById('quarterKelly').textContent = `$${quarterKelly.toFixed(2)}`;
+            document.getElementById('recommendedKelly').textContent = `$${recommended.toFixed(2)}`;
+        }
+
+        // Initialize on load
+        window.addEventListener('load', init);
+    </script>
+</body>
+</html>

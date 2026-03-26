@@ -25,8 +25,23 @@ env/
 Thumbs.db
 *.~lock.*
 
-# Data (user-specific)
+# Data (user-specific, local only)
 data/*.json
+data/*.jsonl
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/*.csv
+data/predictions/
 
 # Logs
 *.log
+
+# Claude local settings
+.claude/
+
+# API Keys & Secrets — 절대 GitHub에 올리지 말 것!
+keys/
+*.pem
+.env
+config.json

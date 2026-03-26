@@ -1,5 +1,12 @@
 requests>=2.31.0
-beautifulsoup4>=4.12.2
 numpy>=1.24.3
-openpyxl>=3.1.2
-reportlab>=4.0.0
+python-dotenv>=1.0.0       # .env 파일 로딩
+
+# Kalshi API 연동
+cryptography>=41.0.0       # RSA-PSS 서명
+websockets>=12.0           # WebSocket 실시간 스트리밍
+kalshi-py>=2.0.6           # Kalshi 공식 SDK (선택사항)
+
+# 분석 & 시각화
+matplotlib>=3.8.0          # 차트
+openpyxl>=3.1.2            # Excel

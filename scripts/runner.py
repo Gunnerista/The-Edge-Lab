@@ -28,6 +28,7 @@ import threading
 import traceback
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 if sys.platform == "win32":
     try:
@@ -279,12 +280,74 @@ def scanner_loop(
 
 
 # ============================================================================
+# Timezone
+# ============================================================================
+
+ET = ZoneInfo("US/Eastern")
+
+def _now_et() -> datetime:
+    """Current time in US/Eastern."""
+    return datetime.now(ET)
+
+
+# ============================================================================
+# Scheduled Tasks: Forward Test + Settle
+# ============================================================================
+
+_forward_test_done_today = False
+_settle_done_today = False
+
+def run_scheduled_tasks():
+    """
+    Check and run time-based tasks (all times in ET):
+      - 12:00 PM ET: Forward test (predict today's NBA games)
+      - 11:59 PM ET: Settle predictions (check box scores)
+    """
+    global _forward_test_done_today, _settle_done_today
+
+    now = _now_et()
+    today_str = now.strftime("%Y-%m-%d")
+
+    # Reset flags at midnight
+    if now.hour == 0 and now.minute < 2:
+        _forward_test_done_today = False
+        _settle_done_today = False
+
+    # 12:00 PM ET — Forward test
+    if now.hour == 12 and now.minute < 2 and not _forward_test_done_today:
+        _forward_test_done_today = True
+        logger.info(f"[Scheduler] Running forward test for {today_str} (12:00 PM ET)")
+        try:
+            from forward_test import run_forward_test
+            from datetime import date as date_cls
+            today_date = now.date()
+            tomorrow = today_date + timedelta(days=1)
+            run_forward_test([today_date, tomorrow])
+            logger.info("[Scheduler] Forward test complete")
+        except Exception as e:
+            logger.error(f"[Scheduler] Forward test failed: {e}")
+            alert_error(f"Forward test failed: {e}")
+
+    # 11:59 PM ET — Settle predictions
+    if now.hour == 23 and now.minute >= 55 and not _settle_done_today:
+        _settle_done_today = True
+        logger.info(f"[Scheduler] Settling predictions for {today_str} (11:59 PM ET)")
+        try:
+            from settle_predictions import settle
+            settle(target_date=today_str)
+            logger.info("[Scheduler] Settle complete")
+        except Exception as e:
+            logger.error(f"[Scheduler] Settle failed: {e}")
+            alert_error(f"Settle predictions failed: {e}")
+
+
+# ============================================================================
 # Daily Summary
 # ============================================================================
 
 def send_daily_summary_if_due():
-    """Check if it's time for daily summary (10pm local)."""
-    now = datetime.now()
+    """Check if it's time for daily summary (10pm ET)."""
+    now = _now_et()
     if now.hour == 22 and now.minute < 2:
         try:
             config = KalshiConfig.from_env()
@@ -391,9 +454,11 @@ def main():
     print("  ====================================================")
     print("  PREDICTION MARKET WAR MACHINE - Runner")
     print("  ====================================================")
+    print(f"  Timezone:    US/Eastern ({_now_et().strftime('%I:%M %p ET')})")
     print(f"  Observer:    {'ON' if not args.scan_only else 'OFF'} ({args.observe_interval}s)")
     print(f"  Scanner:     {'ON' if not args.observe_only else 'OFF'} ({args.scan_interval}s)")
     print(f"  Auto-Trade:  {trade_mode}")
+    print(f"  Scheduled:   Forward test 12:00pm ET, Settle 11:59pm ET")
     print(f"  Settlement:  {settlement_hours}h filter" if settlement_hours else "  Settlement:  No filter")
     print(f"  Discord:     {'Configured' if _get_webhook() else 'Not set (DISCORD_WEBHOOK_URL)'}")
     print("  ====================================================")
@@ -439,11 +504,12 @@ def main():
         t.start()
         logger.info(f"Started thread: {t.name}")
 
-    # Keep main thread alive, check for daily summary
+    # Keep main thread alive — scheduled tasks + daily summary (all ET)
     try:
         while not stop_event.is_set():
             stop_event.wait(timeout=60)
-            send_daily_summary_if_due()
+            run_scheduled_tasks()     # 12pm forward test, 11:59pm settle
+            send_daily_summary_if_due()  # 10pm daily summary
     except KeyboardInterrupt:
         stop_event.set()
 

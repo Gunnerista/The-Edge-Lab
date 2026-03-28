@@ -40,6 +40,13 @@ from pathlib import Path
 from typing import Dict, List, Optional
 from dataclasses import dataclass, asdict
 
+# NBA model integration
+try:
+    from nba_model import NBAModel, PropPrediction
+    NBA_MODEL_AVAILABLE = True
+except ImportError:
+    NBA_MODEL_AVAILABLE = False
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from dotenv import load_dotenv
@@ -633,6 +640,167 @@ class SignalEngine:
         return signals
 
     # ----------------------------------------------------------------
+    # Detector 2b: NBA Player Props (Real Model)
+    # ----------------------------------------------------------------
+
+    def detect_nba_prop_signals(self) -> List[Signal]:
+        """
+        Detect +EV NBA player prop opportunities using REAL basketball data.
+
+        Unlike detect_overreaction_signals() which uses self-referential
+        Kalshi price history, this uses:
+          - Player season stats + recent form
+          - Opponent defensive matchup
+          - Home/away + B2B adjustments
+          - Normal distribution P(X > line)
+
+        Only fires for markets classified as sports/nba player props.
+        """
+        if not NBA_MODEL_AVAILABLE:
+            logger.warning("[SignalEngine] NBA model not available, skipping NBA prop scan")
+            return []
+
+        signals = []
+
+        # Find NBA player prop markets using exact Kalshi ticker prefixes
+        # from market_classifier.py:
+        #   KXNBAPTS = points, KXNBAREB = rebounds, KXNBAAST = assists
+        #   KXNBA3PT = threes, KXNBASTL = steals, KXNBABLK = blocks
+        nba_markets = self._query("""
+            SELECT m.ticker, m.title, m.category, m.sub_category, m.market_type,
+                   m.expiration_time, m.close_time,
+                   s.yes_bid, s.yes_ask, s.yes_price, s.volume
+            FROM markets m
+            JOIN price_snapshots s ON m.ticker = s.ticker
+            WHERE (
+                m.ticker LIKE 'KXNBAPTS%'
+                OR m.ticker LIKE 'KXNBAREB%'
+                OR m.ticker LIKE 'KXNBAAST%'
+                OR m.ticker LIKE 'KXNBA3PT%'
+                OR m.ticker LIKE 'KXNBASTL%'
+                OR m.ticker LIKE 'KXNBABLK%'
+            )
+            AND s.yes_bid > 0 AND s.yes_ask > 0
+            AND s.rowid IN (SELECT MAX(rowid) FROM price_snapshots GROUP BY ticker)
+            AND m.status = 'open'
+        """)
+
+        nba_markets = self._apply_settlement_filter(nba_markets)
+
+        if not nba_markets:
+            logger.debug("[SignalEngine] No NBA prop markets found")
+            return []
+
+        try:
+            model = NBAModel()
+        except Exception as e:
+            logger.error(f"[SignalEngine] Failed to initialize NBA model: {e}")
+            return []
+
+        for mkt in nba_markets:
+            ticker = mkt["ticker"]
+            title = mkt.get("title", "")
+            yes_bid = mkt["yes_bid"]
+            yes_ask = mkt["yes_ask"]
+            mid_price = mkt["yes_price"] or (yes_bid + yes_ask) / 2
+            spread_cents = (yes_ask - yes_bid) * 100
+
+            # Skip wide spreads
+            if spread_cents > self.MAX_SPREAD_CENTS:
+                continue
+
+            # Skip extreme prices
+            if mid_price <= 0.10 or mid_price >= 0.90:
+                continue
+
+            try:
+                prediction = model.process_kalshi_nba_ticker(ticker, title, mid_price)
+            except Exception as e:
+                logger.debug(f"[SignalEngine] NBA model error for {ticker}: {e}")
+                continue
+
+            if not prediction:
+                continue
+
+            # Determine side: if model says higher prob than market, buy YES
+            # If model says lower prob, buy NO
+            model_prob_yes = prediction.model_prob
+            market_prob_yes = mid_price
+
+            if model_prob_yes > market_prob_yes:
+                side = "yes"
+                entry = yes_bid  # buy YES at bid
+                model_prob = model_prob_yes
+            else:
+                side = "no"
+                entry = 1 - yes_ask  # buy NO
+                model_prob = 1 - model_prob_yes
+
+            if entry <= 0 or entry >= 1:
+                continue
+
+            ev = net_ev(model_prob, entry, side)
+            edge = model_prob - breakeven_prob(entry)
+
+            # Only signal if edge meets threshold
+            if ev <= self.MIN_NET_EV_CENTS / 100 or edge < self.MIN_EDGE:
+                continue
+
+            hours_to_settle = self._hours_to_settlement(ticker, self.conn)
+            ev_per_hour = (ev * 100) / max(hours_to_settle, 0.1)
+
+            # Confidence from model
+            confidence = prediction.confidence
+
+            # Skip low confidence unless edge is massive
+            if confidence == "low" and edge < 0.10:
+                continue
+
+            signals.append(Signal(
+                ticker=ticker,
+                title=title or ticker,
+                category=mkt.get("category", "sports"),
+                sub_category=mkt.get("sub_category", "nba"),
+                signal_type="nba_prop_model",
+                side=side,
+                entry_price=entry,
+                model_prob=round(model_prob, 4),
+                market_prob=round(mid_price, 4),
+                edge=round(abs(edge), 4),
+                net_ev_cents=round(ev * 100, 2),
+                confidence=confidence,
+                urgency="immediate" if edge > 0.10 else "watch",
+                reasoning=(
+                    f"NBA Model: {prediction.reasoning} | "
+                    f"Market={mid_price*100:.0f}c vs Model={model_prob_yes*100:.0f}c | "
+                    f"Edge={edge*100:.1f}% | EV/h={ev_per_hour:.2f}c"
+                ),
+                detected_at=datetime.now(timezone.utc).isoformat(),
+                data={
+                    "player": prediction.player_name,
+                    "prop_type": prediction.prop_type,
+                    "line": prediction.line,
+                    "projected": prediction.projected_value,
+                    "std_dev": prediction.std_dev,
+                    "matchup_adj": prediction.matchup_adjustment,
+                    "b2b_adj": prediction.b2b_adjustment,
+                    "pace_adj": prediction.pace_adjustment,
+                    "injury": prediction.injury_status,
+                    "model_source": "nba_model_v1",
+                    "yes_bid": round(yes_bid, 4),
+                    "yes_ask": round(yes_ask, 4),
+                    "spread_cents": round(spread_cents, 1),
+                    "hours_to_settlement": round(hours_to_settle, 1),
+                    "ev_per_hour": round(ev_per_hour, 3),
+                    "data_quality": prediction.data_quality,
+                },
+            ))
+
+        model.close()
+        logger.info(f"[SignalEngine] NBA prop model: {len(signals)} signals")
+        return signals
+
+    # ----------------------------------------------------------------
     # Detector 3: Cross-Market Correlation
     # ----------------------------------------------------------------
 
@@ -797,6 +965,7 @@ class SignalEngine:
 
         # Run each detector
         detectors = [
+            ("nba_props", self.detect_nba_prop_signals),
             ("spread", self.detect_spread_signals),
             ("overreaction", self.detect_overreaction_signals),
             ("cross_market", self.detect_cross_market_signals),

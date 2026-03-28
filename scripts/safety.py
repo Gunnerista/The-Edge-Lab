@@ -34,12 +34,12 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 # ============================================================================
 
 SAFETY_CONFIG = {
-    "starting_bankroll": 360,
+    "starting_bankroll": 300,       # paper trading virtual bankroll
     "max_single_bet": 35,
     "max_single_bet_arb": 50,       # arbitrage (confirmed profit) has higher limit
     "daily_max_loss": 75,
     "weekly_max_loss": 150,
-    "min_edge_pregame": 0.05,
+    "min_edge_pregame": 0.10,
     "min_edge_live": 0.08,
     "min_volume": 0,                # allow low-volume markets (new strategy)
     "max_spread_cents": 15,

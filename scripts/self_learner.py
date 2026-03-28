@@ -33,7 +33,7 @@ MIN_SAMPLES = 50  # minimum settled trades before tuning activates
 
 # Default parameter values
 DEFAULTS = {
-    "min_edge": 0.05,
+    "min_edge": 0.10,
     "vpin_cutoff": 0.70,
     "overreaction_threshold": 0.08,
     "overreaction_relative": 0.15,
@@ -45,7 +45,7 @@ DEFAULTS = {
 
 # Hard bounds: parameters cannot go outside these ranges
 BOUNDS = {
-    "min_edge":                (0.02, 0.20),
+    "min_edge":                (0.08, 0.20),
     "vpin_cutoff":             (0.40, 0.90),
     "overreaction_threshold":  (0.04, 0.20),
     "overreaction_relative":   (0.08, 0.30),

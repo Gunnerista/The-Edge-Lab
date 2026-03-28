@@ -97,10 +97,16 @@ def _log_paper_trade(ticker: str, title: str, side: str, price_cents: int,
         f.write(json.dumps(entry) + "\n")
 
 # ============================================================================
+# SAFETY KILL SWITCH
+# ============================================================================
+# DANGER: Set to False only after forward test validation and Ikjun approval
+FORCE_DRY_RUN = True
+
+# ============================================================================
 # Auto-Trading Thresholds
 # ============================================================================
 
-MIN_EDGE_AUTO = 0.05           # 5% minimum edge for auto-entry
+MIN_EDGE_AUTO = 0.10           # 10% minimum edge for auto-entry (was 5%, fee-adjusted backtest confirmed <10% is negative ROI)
 MIN_EDGE_ARB = 0.01            # 1% for arbitrage (confirmed profit)
 MIN_EDGE_MARKET_ORDER = 0.25   # 25% edge -> use market order (buy at ask for instant fill)
 MAX_SPREAD_CENTS_AUTO = 10     # 10c max spread for auto-entry
@@ -248,7 +254,15 @@ class AutoTrader:
         except Exception as e:
             logger.error(f"[AutoTrader] Position sync error: {e}")
 
-        # 5. Check paper trade settlements
+        # 5. Exit monitor: check open positions for mid-trade exits
+        try:
+            exit_results = self.exit_monitor()
+            if exit_results.get("exits_triggered", 0) > 0:
+                logger.info(f"[AutoTrader] Exit monitor: {exit_results}")
+        except Exception as e:
+            logger.error(f"[AutoTrader] Exit monitor error: {e}")
+
+        # 6. Check paper trade settlements
         try:
             self.check_paper_settlements()
         except Exception as e:
@@ -299,6 +313,19 @@ class AutoTrader:
 
             # Block: any "yes [team]" or "no [team]" patterns with commas = parlay
             if ",yes" in title_lower or ",no " in title_lower:
+                continue
+
+            # === Phase 1: NBA-only auto-entry ===
+            # Non-NBA markets: self-referential model has no real edge.
+            # Only allow nba_prop_model signals (from real basketball data).
+            # Other signal types (overreaction_fade, spread, volume) from non-NBA
+            # markets are blocked until those markets get real models too.
+            if sig.signal_type != "nba_prop_model":
+                self.learn.signal_skipped(
+                    sig.ticker, sig.signal_type,
+                    f"Phase 1: only NBA prop model signals allowed (got {sig.signal_type})",
+                    price=sig.entry_price, edge=sig.edge,
+                )
                 continue
 
             # Filter: edge threshold (uses tuned param)
@@ -632,6 +659,198 @@ class AutoTrader:
                 logger.debug(f"Settlement check error for {ticker}: {e}")
 
     # ----------------------------------------------------------------
+    # Exit Monitor: Mid-Trade Exit Strategy
+    # ----------------------------------------------------------------
+
+    EXIT_PROFIT_THRESHOLD = 0.50   # 50% profit → sell
+    EXIT_LOSS_THRESHOLD = -0.30    # 30% loss → cut
+    EXIT_TIME_THRESHOLD_HOURS = 2  # < 2h to settlement → consider exit
+
+    def exit_monitor(self) -> dict:
+        """
+        Monitor open positions and trigger exits when thresholds are hit.
+
+        Exit conditions:
+          1. Profit target: unrealized P&L >= 50% of entry cost → sell
+          2. Stop loss: unrealized P&L <= -30% of entry cost → sell
+          3. Time exit: < 2h to settlement + losing position → sell
+
+        Returns summary of exit actions taken.
+        """
+        results = {"exits_triggered": 0, "exits_submitted": 0}
+
+        if not PAPER_TRADES_FILE.exists():
+            return results
+
+        lines = []
+        with open(PAPER_TRADES_FILE, "r", encoding="utf-8") as f:
+            lines = [line.strip() for line in f if line.strip()]
+
+        updated = []
+        exits = 0
+
+        for line in lines:
+            entry = json.loads(line)
+            if entry.get("source") != "auto" or entry.get("status") != "open":
+                updated.append(line)
+                continue
+
+            ticker = entry["ticker"]
+            side = entry["side"]
+            entry_price = entry["price_cents"] / 100
+            count = entry["count"]
+            cost = entry_price * count
+
+            try:
+                # Get current market price from Kalshi
+                market_data = self.client.get_market(ticker)
+                market = market_data.get("market", market_data)
+                result = market.get("result", "")
+
+                # If already settled, skip (will be handled by check_paper_settlements)
+                if result in ("yes", "no"):
+                    updated.append(line)
+                    continue
+
+                # Current YES price
+                yes_price = market.get("yes_price", 0)
+                if not yes_price:
+                    yes_bid = market.get("yes_bid", 0)
+                    yes_ask = market.get("yes_ask", 0)
+                    yes_price = (yes_bid + yes_ask) / 2 if yes_bid and yes_ask else 0
+
+                if yes_price <= 0:
+                    updated.append(line)
+                    continue
+
+                # Calculate unrealized P&L
+                if side == "yes":
+                    current_value = yes_price * count
+                    sell_price = yes_price
+                else:
+                    current_value = (1 - yes_price) * count
+                    sell_price = 1 - yes_price
+
+                # Gross unrealized (before fees on exit)
+                unrealized_gross = current_value - cost
+                unrealized_pct = unrealized_gross / cost if cost > 0 else 0
+
+                # Hours to settlement
+                hours = self._hours_to_settlement_for_ticker(ticker)
+
+                # Exit decision
+                exit_reason = None
+
+                if unrealized_pct >= self.EXIT_PROFIT_THRESHOLD:
+                    exit_reason = f"profit_target ({unrealized_pct:.0%} >= {self.EXIT_PROFIT_THRESHOLD:.0%})"
+                elif unrealized_pct <= self.EXIT_LOSS_THRESHOLD:
+                    exit_reason = f"stop_loss ({unrealized_pct:.0%} <= {self.EXIT_LOSS_THRESHOLD:.0%})"
+                elif hours < self.EXIT_TIME_THRESHOLD_HOURS and unrealized_pct < 0:
+                    exit_reason = f"time_exit ({hours:.1f}h left, losing {unrealized_pct:.0%})"
+
+                if exit_reason:
+                    results["exits_triggered"] += 1
+
+                    # Calculate net P&L after fees
+                    if unrealized_gross > 0:
+                        fee = unrealized_gross * KALSHI_FEE_RATE
+                        net_pnl = unrealized_gross - fee
+                    else:
+                        fee = 0
+                        net_pnl = unrealized_gross
+
+                    # Mark as exited
+                    entry["status"] = "exited"
+                    entry["exit_reason"] = exit_reason
+                    entry["exit_price"] = round(sell_price * 100)
+                    entry["exit_at"] = datetime.now(timezone.utc).isoformat()
+                    entry["paper_pnl"] = round(net_pnl, 4)
+                    entry["fee"] = round(fee, 4)
+
+                    # In paper mode, just log. In live mode, would submit sell order.
+                    if self.dry_run:
+                        logger.info(
+                            f"[Exit] PAPER: {ticker} {side} | {exit_reason} | "
+                            f"P&L=${net_pnl:.2f} ({unrealized_pct:.0%})"
+                        )
+                    else:
+                        # Live exit: submit sell order
+                        try:
+                            sell_side = "no" if side == "yes" else "yes"
+                            order = self.trade_engine.prepare_order(
+                                ticker=ticker,
+                                side=sell_side,
+                                price_cents=int(sell_price * 100),
+                                count=count,
+                                signal_type="exit_monitor",
+                                reasoning=exit_reason,
+                                model_prob=0.5,
+                                edge=0,
+                            )
+                            self.trade_engine.execute_order(order, dry_run=False)
+                            results["exits_submitted"] += 1
+                        except Exception as e:
+                            logger.error(f"[Exit] Error submitting exit for {ticker}: {e}")
+
+                    # Discord alert
+                    emoji = "\U0001f4b0" if net_pnl > 0 else "\U0001f534"
+                    _discord(
+                        f"{emoji} **Exit**: {(entry.get('title', ticker))[:40]} | "
+                        f"{exit_reason} | P&L=${net_pnl:+.2f}"
+                    )
+
+                    self.learn._write({
+                        "type": "exit_triggered",
+                        "ticker": ticker,
+                        "side": side,
+                        "reason": exit_reason,
+                        "pnl": round(net_pnl, 4),
+                        "unrealized_pct": round(unrealized_pct, 4),
+                        "hours_to_settlement": round(hours, 1),
+                    })
+
+                    exits += 1
+                    updated.append(json.dumps(entry))
+                else:
+                    updated.append(line)
+
+            except Exception as e:
+                logger.debug(f"[Exit] Monitor error for {ticker}: {e}")
+                updated.append(line)
+
+        # Rewrite file
+        if exits > 0:
+            with open(PAPER_TRADES_FILE, "w", encoding="utf-8") as f:
+                f.write("\n".join(updated) + "\n" if updated else "")
+            logger.info(f"[Exit] Triggered {exits} exits")
+
+        return results
+
+    def _hours_to_settlement_for_ticker(self, ticker: str) -> float:
+        """Get hours to settlement for a ticker from DB."""
+        try:
+            import sqlite3 as _sqlite3
+            conn = _sqlite3.connect(str(PROJECT_ROOT / "data" / "market_data.db"))
+            row = conn.execute(
+                "SELECT expiration_time, close_time FROM markets WHERE ticker = ?",
+                (ticker,)
+            ).fetchone()
+            conn.close()
+            if not row:
+                return 999.0
+            exp = row[0] or row[1] or ""
+            if not exp:
+                return 999.0
+            from dateutil.parser import parse as dtparse
+            exp_dt = dtparse(exp)
+            now = datetime.now(timezone.utc)
+            if exp_dt.tzinfo is None:
+                exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+            return max(0.1, (exp_dt - now).total_seconds() / 3600)
+        except Exception:
+            return 999.0
+
+    # ----------------------------------------------------------------
     # Helpers
     # ----------------------------------------------------------------
 
@@ -716,12 +935,16 @@ class AutoTrader:
                     won = (side == "yes" and result == "yes") or (side == "no" and result == "no")
 
                     if won:
-                        pnl = (1 - price) * count
+                        gross_profit = (1 - price) * count
+                        fee = gross_profit * KALSHI_FEE_RATE  # 7% fee on winnings
+                        pnl = gross_profit - fee
                         entry["status"] = "win"
+                        entry["fee"] = round(fee, 4)
                         wins += 1
                     else:
                         pnl = -price * count
                         entry["status"] = "loss"
+                        entry["fee"] = 0.0
                         losses += 1
 
                     entry["settled_at"] = datetime.now(timezone.utc).isoformat()
@@ -913,6 +1136,12 @@ def main():
     parser.add_argument("--interval", type=int, default=120, help="Seconds between cycles")
 
     args = parser.parse_args()
+
+    # SAFETY: FORCE_DRY_RUN overrides CLI flag
+    if FORCE_DRY_RUN and not args.dry_run:
+        print("  [SAFETY] FORCE_DRY_RUN=True -> overriding to dry-run mode")
+        print("  [SAFETY] To go live, set FORCE_DRY_RUN=False in auto_trader.py")
+        args.dry_run = True
 
     logging.basicConfig(
         level=logging.INFO,

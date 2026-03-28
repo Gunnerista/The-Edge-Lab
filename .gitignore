@@ -1,47 +1,32 @@
+# Data & secrets
+*.json
+*.csv
+*.env
+.env*
+secrets/
+data/
+
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
 *.egg-info/
 dist/
 build/
-.eggs/
-
-# Virtual environments
 venv/
-.env/
-env/
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
-*~
 
-# OS
-.DS_Store
-Thumbs.db
-*.~lock.*
-
-# Data (user-specific, local only)
-data/*.json
-data/*.jsonl
-data/*.db
-data/*.db-shm
-data/*.db-wal
-data/*.csv
-data/predictions/
-
-# Logs
+# Logs (keep markdown logs, ignore runtime logs)
 *.log
 
-# Claude local settings
-.claude/
-
-# API Keys & Secrets — 절대 GitHub에 올리지 말 것!
-keys/
-*.pem
-.env
-config.json
+# Jupyter
+.ipynb_checkpoints/

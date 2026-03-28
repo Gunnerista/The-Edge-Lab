@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="assets/banner.png" alt="THE EDGE LAB" width="800"/>
-</p>
-
 <h1 align="center">THE EDGE LAB</h1>
 
 <p align="center">

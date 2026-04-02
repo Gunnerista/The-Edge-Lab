@@ -37,7 +37,6 @@ Usage:
 import sys
 import math
 import json
-import sqlite3
 import logging
 import argparse
 from datetime import datetime, timezone, date
@@ -48,23 +47,11 @@ from dataclasses import dataclass, asdict
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from db import get_connection, put_connection
+
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-# NBA stats live in a separate lightweight DB (nba_data.db)
-# market_data.db is for Kalshi price data only (6.7GB + WAL)
-def _find_nba_db() -> Path:
-    candidates = [
-        PROJECT_ROOT / "data" / "nba_data.db",
-        Path.home() / "nba_data.db",
-        Path("/tmp") / "nba_data.db",
-    ]
-    for c in candidates:
-        if c.exists():
-            return c
-    return candidates[0]  # default even if not yet created
-
-DB_PATH = _find_nba_db()
 
 
 # ============================================================================
@@ -109,8 +96,8 @@ LEAGUE_AVG_PACE = 100.0
 # Platt scaling parameters (fitted on OOS train set, Jan-Feb 2026)
 # Applies sigmoid recalibration: P_cal = sigmoid(PLATT_A * logit(P_raw) + PLATT_B)
 # Only used when edge > 20% where Platt outperforms raw (net ROI +4.5% vs +3.0%)
-PLATT_A = 0.5750
-PLATT_B = -0.0108
+PLATT_A = 0.8976
+PLATT_B = -0.4242
 PLATT_EDGE_THRESHOLD = 0.20  # only apply Platt when |edge| > 20%
 
 # Edge shrinkage: when model-vs-market divergence is large (≥20%),
@@ -235,10 +222,8 @@ class NBAModel:
     this model generates probabilities from REAL basketball data.
     """
 
-    def __init__(self, db_path: Path = DB_PATH):
-        self.db_path = db_path
-        self.conn = sqlite3.connect(str(db_path))
-        self.conn.row_factory = sqlite3.Row
+    def __init__(self):
+        self.conn = get_connection(dict_cursor=True)
         self._season = self._get_current_season()
 
     def _get_current_season(self) -> str:
@@ -249,7 +234,9 @@ class NBAModel:
             return f"{today.year - 1}-{str(today.year)[-2:]}"
 
     def _query_one(self, sql: str, params: tuple = ()) -> Optional[dict]:
-        row = self.conn.execute(sql, params).fetchone()
+        cur = self.conn.cursor()
+        cur.execute(sql, params)
+        row = cur.fetchone()
         return dict(row) if row else None
 
     # ----------------------------------------------------------------
@@ -561,7 +548,7 @@ class NBAModel:
         """Find player in database."""
         # Exact match
         row = self._query_one(
-            "SELECT * FROM nba_players WHERE player_name = ? AND season = ?",
+            "SELECT * FROM nba_players WHERE player_name = %s AND season = %s",
             (name, self._season)
         )
         if row:
@@ -569,7 +556,7 @@ class NBAModel:
 
         # Fuzzy match
         row = self._query_one(
-            "SELECT * FROM nba_players WHERE player_name LIKE ? AND season = ? LIMIT 1",
+            "SELECT * FROM nba_players WHERE player_name LIKE %s AND season = %s LIMIT 1",
             (f"%{name}%", self._season)
         )
         return row
@@ -583,7 +570,7 @@ class NBAModel:
         # Direct abbreviation
         if len(abbr) <= 3:
             row = self._query_one(
-                "SELECT * FROM nba_teams WHERE team_abbr = ? AND season = ?",
+                "SELECT * FROM nba_teams WHERE team_abbr = %s AND season = %s",
                 (abbr, self._season)
             )
             if row:
@@ -593,24 +580,26 @@ class NBAModel:
         lookup = TEAM_NAME_TO_ABBR.get(team_input.lower().strip(), "")
         if lookup:
             return self._query_one(
-                "SELECT * FROM nba_teams WHERE team_abbr = ? AND season = ?",
+                "SELECT * FROM nba_teams WHERE team_abbr = %s AND season = %s",
                 (lookup, self._season)
             )
 
         # Fuzzy
         return self._query_one(
-            "SELECT * FROM nba_teams WHERE team_name LIKE ? AND season = ?",
+            "SELECT * FROM nba_teams WHERE team_name LIKE %s AND season = %s",
             (f"%{team_input}%", self._season)
         )
 
     def _get_injury_status(self, player_name: str) -> str:
         """Get injury status for player."""
-        row = self.conn.execute(
-            "SELECT status, injury_detail FROM nba_injuries WHERE player_name LIKE ?",
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT status, injury_detail FROM nba_injuries WHERE player_name LIKE %s",
             (f"%{player_name}%",)
-        ).fetchone()
+        )
+        row = cur.fetchone()
         if row:
-            return f"{row[0]} ({row[1]})" if row[1] else str(row[0])
+            return f"{row['status']} ({row['injury_detail']})" if row["injury_detail"] else str(row["status"])
         return ""
 
     def _is_b2b(self, team_abbr: str, game_date: str = None) -> bool:
@@ -618,16 +607,18 @@ class NBAModel:
         if game_date is None:
             game_date = datetime.now(ZoneInfo("US/Eastern")).date().isoformat()
 
-        row = self.conn.execute("""
+        cur = self.conn.cursor()
+        cur.execute("""
             SELECT is_back_to_back_home, is_back_to_back_away,
                    home_team_abbr
             FROM nba_games
-            WHERE game_date = ? AND (home_team_abbr = ? OR away_team_abbr = ?)
-        """, (game_date, team_abbr, team_abbr)).fetchone()
+            WHERE game_date = %s AND (home_team_abbr = %s OR away_team_abbr = %s)
+        """, (game_date, team_abbr, team_abbr))
+        row = cur.fetchone()
 
         if not row:
             return False
-        return bool(row[0]) if row[2] == team_abbr else bool(row[1])
+        return bool(row["is_back_to_back_home"]) if row["home_team_abbr"] == team_abbr else bool(row["is_back_to_back_away"])
 
     # ----------------------------------------------------------------
     # Batch Processing (for signal_engine integration)
@@ -841,36 +832,40 @@ class NBAModel:
         e.g. GSWKPORZINGIS7 → team=GSW, initial=K, last=Porzingis
         """
         # Exact team + last name match
-        row = self.conn.execute(
+        cur = self.conn.cursor()
+        cur.execute(
             """SELECT player_name FROM nba_players
-               WHERE team_abbr = ? AND player_name LIKE ?
-               AND season = ? AND games_played >= 5
+               WHERE team_abbr = %s AND player_name LIKE %s
+               AND season = %s AND games_played >= 5
                LIMIT 1""",
             (team_abbr, f"% {last_name}%", self._season)
-        ).fetchone()
+        )
+        row = cur.fetchone()
         if row:
-            return row[0]
+            return row["player_name"]
 
         # Try without team (player might have been traded)
-        row = self.conn.execute(
+        cur.execute(
             """SELECT player_name FROM nba_players
-               WHERE player_name LIKE ?
-               AND season = ? AND games_played >= 5
+               WHERE player_name LIKE %s
+               AND season = %s AND games_played >= 5
                LIMIT 1""",
             (f"% {last_name}%", self._season)
-        ).fetchone()
+        )
+        row = cur.fetchone()
         if row:
-            return row[0]
+            return row["player_name"]
 
         # Case-insensitive broader search
-        row = self.conn.execute(
+        cur.execute(
             """SELECT player_name FROM nba_players
-               WHERE LOWER(player_name) LIKE LOWER(?)
-               AND season = ? AND games_played >= 5
+               WHERE LOWER(player_name) LIKE LOWER(%s)
+               AND season = %s AND games_played >= 5
                LIMIT 1""",
             (f"%{last_name}%", self._season)
-        ).fetchone()
-        return row[0] if row else None
+        )
+        row = cur.fetchone()
+        return row["player_name"] if row else None
 
     def _extract_player_name(self, title: str) -> Optional[str]:
         """Extract player name from market title by matching against DB."""
@@ -879,16 +874,19 @@ class NBAModel:
 
         # Try to match known players
         # Get all active player names
-        players = self.conn.execute(
-            "SELECT player_name FROM nba_players WHERE season = ? AND games_played >= 10",
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT player_name FROM nba_players WHERE season = %s AND games_played >= 10",
             (self._season,)
-        ).fetchall()
+        )
+        players = cur.fetchall()
 
         title_lower = title.lower()
         best_match = None
         best_len = 0
 
-        for (name,) in players:
+        for row in players:
+            name = row["player_name"]
             if name.lower() in title_lower and len(name) > best_len:
                 best_match = name
                 best_len = len(name)
@@ -922,7 +920,8 @@ class NBAModel:
         return ""
 
     def close(self):
-        self.conn.close()
+        put_connection(self.conn)
+        self.conn = None
 
 
 # ============================================================================

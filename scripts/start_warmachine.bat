@@ -3,7 +3,7 @@
 :: Restarts on crash with 5 second delay
 :: Place shortcut in shell:startup for boot autostart
 
-cd /d "C:\Users\Dell\Documents\Claude\Projects\베팅\sports-betting-system"
+cd /d "C:\Users\Dell\Desktop\Projects\sports-betting-system"
 
 :loop
 echo [%date% %time%] Starting War Machine (LIVE)...

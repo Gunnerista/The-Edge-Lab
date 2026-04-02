@@ -36,7 +36,6 @@ import io
 import json
 import time
 import math
-import sqlite3
 import logging
 import argparse
 from datetime import datetime, timezone, timedelta
@@ -59,11 +58,11 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from kalshi_client import KalshiConfig, KalshiAPIClient, create_client
 from signal_engine import KALSHI_FEE_RATE, net_ev, breakeven_prob
+from db import get_connection, put_connection
 
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DB_PATH = PROJECT_ROOT / "data" / "market_data.db"
 
 
 # ============================================================================
@@ -77,30 +76,9 @@ class HistoryMiner:
     closing line accuracy, vig distribution.
     """
 
-    def __init__(self, client: KalshiAPIClient, db_path: Path = DB_PATH):
+    def __init__(self, client: KalshiAPIClient):
         self.client = client
-        self.conn = sqlite3.connect(str(db_path))
-        self._ensure_table()
-
-    def _ensure_table(self):
-        self.conn.executescript("""
-            CREATE TABLE IF NOT EXISTS settled_markets (
-                ticker TEXT PRIMARY KEY,
-                event_ticker TEXT DEFAULT '',
-                title TEXT DEFAULT '',
-                category TEXT DEFAULT '',
-                result TEXT DEFAULT '',
-                last_yes_bid REAL DEFAULT 0,
-                last_yes_ask REAL DEFAULT 0,
-                last_yes_mid REAL DEFAULT 0,
-                volume REAL DEFAULT 0,
-                close_time TEXT DEFAULT '',
-                fetched_at TEXT DEFAULT ''
-            );
-            CREATE INDEX IF NOT EXISTS idx_settled_result ON settled_markets(result);
-            CREATE INDEX IF NOT EXISTS idx_settled_volume ON settled_markets(volume);
-        """)
-        self.conn.commit()
+        self.conn = get_connection()
 
     def fetch_settled_markets(self, max_pages: int = 20) -> int:
         """Pull settled markets from Kalshi API into local DB."""
@@ -131,12 +109,24 @@ class HistoryMiner:
                 mid = (yb + ya) / 2 if yb > 0 and ya > 0 else float(m.get("last_price_dollars", 0) or 0)
                 vol = float(m.get("volume_fp", 0) or 0)
 
-                self.conn.execute(
-                    """INSERT OR REPLACE INTO settled_markets
+                cur = self.conn.cursor()
+                cur.execute(
+                    """INSERT INTO settled_markets
                        (ticker, event_ticker, title, category, result,
                         last_yes_bid, last_yes_ask, last_yes_mid, volume,
                         close_time, fetched_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                       ON CONFLICT (ticker) DO UPDATE SET
+                           event_ticker = EXCLUDED.event_ticker,
+                           title = EXCLUDED.title,
+                           category = EXCLUDED.category,
+                           result = EXCLUDED.result,
+                           last_yes_bid = EXCLUDED.last_yes_bid,
+                           last_yes_ask = EXCLUDED.last_yes_ask,
+                           last_yes_mid = EXCLUDED.last_yes_mid,
+                           volume = EXCLUDED.volume,
+                           close_time = EXCLUDED.close_time,
+                           fetched_at = EXCLUDED.fetched_at""",
                     (
                         ticker,
                         m.get("event_ticker", ""),
@@ -199,7 +189,7 @@ class HistoryMiner:
                 SELECT COUNT(*) as total,
                        SUM(CASE WHEN result = 'yes' THEN 1 ELSE 0 END) as yes_count
                 FROM settled_markets
-                WHERE last_yes_mid >= ? AND last_yes_mid < ?
+                WHERE last_yes_mid >= %s AND last_yes_mid < %s
                 AND result IN ('yes', 'no') AND volume > 0
             """, (lo, hi))
             row = cur.fetchone()
@@ -258,7 +248,8 @@ class HistoryMiner:
         }
 
     def close(self):
-        self.conn.close()
+        put_connection(self.conn)
+        self.conn = None
 
 
 # ============================================================================

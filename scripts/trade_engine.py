@@ -293,23 +293,68 @@ class TradeLogger:
         return records[-limit:]
 
     def get_pnl_summary(self) -> dict:
-        """Calculate P&L from trade history."""
+        """Calculate P&L from settled predictions (PAPER mode) or trade history (LIVE mode)."""
+        KALSHI_FEE = 0.07
+        STARTING_BANKROLL = 300.0
+
+        # PAPER mode: derive P&L from settled prediction_log entries
+        pred_log = Path(__file__).resolve().parent.parent / "data" / "prediction_log.jsonl"
+        if pred_log.exists():
+            settled = []
+            with open(pred_log, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        p = json.loads(line)
+                    except Exception:
+                        continue
+                    if p.get("settled") and p.get("actual_result") in ("yes", "no") and (p.get("edge") or 0) > 0:
+                        settled.append(p)
+
+            if settled:
+                pnl = 0.0
+                wins = 0
+                for p in settled:
+                    buy_price = p.get("kalshi_price") or 0.5
+                    model_p = p.get("model_prob", 0.5)
+                    bet_yes = model_p > buy_price
+                    entry = buy_price if bet_yes else (1 - buy_price)
+                    won = (p["actual_result"] == "yes") if bet_yes else (p["actual_result"] == "no")
+                    if won:
+                        pnl += (1 - entry) * (1 - KALSHI_FEE)
+                        wins += 1
+                    else:
+                        pnl -= entry
+                return {
+                    "total_trades": len(settled),
+                    "buys": len(settled),
+                    "sells": wins,
+                    "total_spent": 0,
+                    "total_received": 0,
+                    "realized_pnl": round(pnl, 2),
+                    "virtual_bankroll": round(STARTING_BANKROLL + pnl, 2),
+                    "win_rate": round(wins / len(settled), 4) if settled else 0,
+                }
+
+        # Fallback: raw buy/sell accounting from trade_log
         history = self.get_history(limit=10000)
         if not history:
-            return {"total_trades": 0, "total_cost": 0, "message": "No trades yet"}
-
+            return {"total_trades": 0, "total_cost": 0, "realized_pnl": 0, "virtual_bankroll": STARTING_BANKROLL}
         total_cost = sum(h.get("total_cost", 0) for h in history if h.get("action") == "buy")
         total_revenue = sum(h.get("total_cost", 0) for h in history if h.get("action") == "sell")
         buys = sum(1 for h in history if h.get("action") == "buy")
         sells = sum(1 for h in history if h.get("action") == "sell")
-
+        pnl = total_revenue - total_cost
         return {
             "total_trades": len(history),
             "buys": buys,
             "sells": sells,
             "total_spent": round(total_cost, 2),
             "total_received": round(total_revenue, 2),
-            "realized_pnl": round(total_revenue - total_cost, 2),
+            "realized_pnl": round(pnl, 2),
+            "virtual_bankroll": round(STARTING_BANKROLL + pnl, 2),
         }
 
 

@@ -11,7 +11,7 @@ Kalshi의 **모든 활성 마켓** 가격 변동을 실시간 기록.
   1) WebSocket: 구독한 마켓의 실시간 tick-by-tick 기록
   2) REST Polling: 주기적으로 전체 마켓 스캔 (마켓 발견 + 스냅샷)
 
-저장소: SQLite (data/market_data.db)
+저장소: PostgreSQL (warmachine DB)
 
 사용법:
     # 기본 실행 (REST polling, 60초 간격)
@@ -30,12 +30,11 @@ Kalshi의 **모든 활성 마켓** 가격 변동을 실시간 기록.
 import sys
 import json
 import time
-import sqlite3
 import asyncio
 import logging
 import argparse
 import signal
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -45,6 +44,8 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from kalshi_client import KalshiConfig, KalshiAPIClient, create_client
+from db import get_connection, put_connection
+from psycopg2.extras import execute_values
 
 logger = logging.getLogger(__name__)
 
@@ -54,13 +55,12 @@ logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
-DB_PATH = DATA_DIR / "market_data.db"
 LEGACY_JSONL = DATA_DIR / "price_observations.jsonl"
 
 # REST polling defaults
 DEFAULT_POLL_INTERVAL = 60       # seconds between full market scans
-MAX_MARKETS_PER_PAGE = 200       # Kalshi API limit
-MAX_PAGES = 50                   # safety cap: 50 * 200 = 10000 markets max
+MAX_MARKETS_PER_PAGE = 1000      # Kalshi API max per page
+MAX_PAGES = 200                  # safety cap: 200 * 1000 = 200K (effectively unlimited)
 
 # WebSocket batching
 WS_FLUSH_INTERVAL = 5           # seconds between DB flushes for WS data
@@ -68,84 +68,27 @@ WS_MARKET_DISCOVERY_INTERVAL = 300  # re-discover markets every 5 min
 
 
 # ============================================================================
-# SQLite Schema & Database
+# PostgreSQL Database
 # ============================================================================
 
-SCHEMA_SQL = """
--- Price snapshots: every observation of a market's price
-CREATE TABLE IF NOT EXISTS price_snapshots (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp   TEXT NOT NULL,                -- ISO 8601 UTC
-    ticker      TEXT NOT NULL,                -- market ticker
-    event_ticker TEXT DEFAULT '',             -- parent event
-    yes_bid     REAL DEFAULT 0,              -- best yes buy price (0-1 dollars)
-    yes_ask     REAL DEFAULT 0,              -- best yes sell price
-    yes_price   REAL DEFAULT 0,              -- mid-price
-    no_bid      REAL DEFAULT 0,
-    no_ask      REAL DEFAULT 0,
-    volume      INTEGER DEFAULT 0,           -- cumulative traded contracts
-    open_interest INTEGER DEFAULT 0,         -- outstanding contracts
-    source      TEXT DEFAULT 'rest'          -- 'rest' or 'ws'
-);
-
--- Market metadata: static info about each market (updated periodically)
-CREATE TABLE IF NOT EXISTS markets (
-    ticker          TEXT PRIMARY KEY,
-    event_ticker    TEXT DEFAULT '',
-    title           TEXT DEFAULT '',
-    subtitle        TEXT DEFAULT '',
-    category        TEXT DEFAULT '',          -- from Kalshi API or our classifier
-    status          TEXT DEFAULT 'open',
-    close_time      TEXT DEFAULT '',
-    expiration_time TEXT DEFAULT '',
-    result          TEXT DEFAULT '',          -- 'yes', 'no', '' (unsettled)
-    first_seen      TEXT NOT NULL,            -- when we first recorded this market
-    last_updated    TEXT NOT NULL
-);
-
--- Trade records: individual fills (from WebSocket trade channel)
-CREATE TABLE IF NOT EXISTS trades (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp   TEXT NOT NULL,
-    ticker      TEXT NOT NULL,
-    yes_price   REAL DEFAULT 0,
-    count       INTEGER DEFAULT 0,
-    taker_side  TEXT DEFAULT ''
-);
-
--- Indices for fast queries
-CREATE INDEX IF NOT EXISTS idx_snapshots_ticker ON price_snapshots(ticker);
-CREATE INDEX IF NOT EXISTS idx_snapshots_time ON price_snapshots(timestamp);
-CREATE INDEX IF NOT EXISTS idx_snapshots_ticker_time ON price_snapshots(ticker, timestamp);
-CREATE INDEX IF NOT EXISTS idx_trades_ticker ON trades(ticker);
-CREATE INDEX IF NOT EXISTS idx_trades_time ON trades(timestamp);
-CREATE INDEX IF NOT EXISTS idx_markets_category ON markets(category);
-CREATE INDEX IF NOT EXISTS idx_markets_status ON markets(status);
-"""
-
-
 class MarketDatabase:
-    """SQLite database for market data storage."""
+    """PostgreSQL database for market data storage."""
 
-    def __init__(self, db_path: Path = DB_PATH):
-        self.db_path = db_path
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.db_path))
-        self.conn.execute("PRAGMA journal_mode=WAL")   # better concurrent reads
-        self.conn.execute("PRAGMA synchronous=NORMAL")  # faster writes, still safe
-        self._init_schema()
-
-    def _init_schema(self):
-        self.conn.executescript(SCHEMA_SQL)
+    def __init__(self):
+        self.conn = get_connection()
+        # Remove statement timeout for the writer connection — bulk upserts can take >120s
+        cur = self.conn.cursor()
+        cur.execute("SET statement_timeout = 0")
         self.conn.commit()
 
     def insert_snapshot(self, snapshot: dict):
         """Insert a single price snapshot."""
-        self.conn.execute(
+        cur = self.conn.cursor()
+        cur.execute(
             """INSERT INTO price_snapshots
                (timestamp, ticker, event_ticker, yes_bid, yes_ask, yes_price,
                 no_bid, no_ask, volume, open_interest, source)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
             (
                 snapshot["timestamp"],
                 snapshot["ticker"],
@@ -165,11 +108,12 @@ class MarketDatabase:
         """Batch insert price snapshots."""
         if not snapshots:
             return
-        self.conn.executemany(
+        cur = self.conn.cursor()
+        cur.executemany(
             """INSERT INTO price_snapshots
                (timestamp, ticker, event_ticker, yes_bid, yes_ask, yes_price,
                 no_bid, no_ask, volume, open_interest, source)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
             [
                 (
                     s["timestamp"], s["ticker"], s.get("event_ticker", ""),
@@ -186,17 +130,18 @@ class MarketDatabase:
     def upsert_market(self, market: dict):
         """Insert or update market metadata."""
         now = datetime.now(timezone.utc).isoformat()
-        self.conn.execute(
+        cur = self.conn.cursor()
+        cur.execute(
             """INSERT INTO markets
                (ticker, event_ticker, title, subtitle, category, status,
                 close_time, expiration_time, result, first_seen, last_updated)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(ticker) DO UPDATE SET
-                   status = excluded.status,
-                   result = excluded.result,
-                   close_time = excluded.close_time,
-                   expiration_time = excluded.expiration_time,
-                   last_updated = excluded.last_updated""",
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+               ON CONFLICT (ticker) DO UPDATE SET
+                   status = EXCLUDED.status,
+                   result = EXCLUDED.result,
+                   close_time = EXCLUDED.close_time,
+                   expiration_time = EXCLUDED.expiration_time,
+                   last_updated = EXCLUDED.last_updated""",
             (
                 market["ticker"],
                 market.get("event_ticker", ""),
@@ -212,11 +157,51 @@ class MarketDatabase:
             ),
         )
 
+    def upsert_markets_batch(self, markets: list, batch_size: int = 5000):
+        """Bulk upsert market metadata using execute_values (single statement per batch)."""
+        if not markets:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        cur = self.conn.cursor()
+        for i in range(0, len(markets), batch_size):
+            chunk = markets[i:i + batch_size]
+            rows = [
+                (
+                    m["ticker"],
+                    m.get("event_ticker", ""),
+                    m.get("title", ""),
+                    m.get("subtitle", ""),
+                    m.get("category", ""),
+                    m.get("status", "open"),
+                    m.get("close_time", ""),
+                    m.get("expiration_time", ""),
+                    m.get("result", ""),
+                    now,
+                    now,
+                )
+                for m in chunk
+            ]
+            execute_values(
+                cur,
+                """INSERT INTO markets
+                   (ticker, event_ticker, title, subtitle, category, status,
+                    close_time, expiration_time, result, first_seen, last_updated)
+                   VALUES %s
+                   ON CONFLICT (ticker) DO UPDATE SET
+                       status = EXCLUDED.status,
+                       result = EXCLUDED.result,
+                       close_time = EXCLUDED.close_time,
+                       expiration_time = EXCLUDED.expiration_time,
+                       last_updated = EXCLUDED.last_updated""",
+                rows,
+            )
+
     def insert_trade(self, trade: dict):
         """Insert a trade record."""
-        self.conn.execute(
+        cur = self.conn.cursor()
+        cur.execute(
             """INSERT INTO trades (timestamp, ticker, yes_price, count, taker_side)
-               VALUES (?, ?, ?, ?, ?)""",
+               VALUES (%s, %s, %s, %s, %s)""",
             (
                 trade["timestamp"],
                 trade["ticker"],
@@ -228,6 +213,18 @@ class MarketDatabase:
 
     def commit(self):
         self.conn.commit()
+
+    def delete_old_snapshots(self, cutoff_iso: str) -> int:
+        """Delete snapshots older than cutoff. Returns deleted row count."""
+        cur = self.conn.cursor()
+        cur.execute(
+            "DELETE FROM price_snapshots WHERE timestamp < %s",
+            (cutoff_iso,),
+        )
+        deleted = cur.rowcount
+        if deleted > 0:
+            self.conn.commit()
+        return deleted
 
     def get_stats(self) -> dict:
         """Get database statistics."""
@@ -242,17 +239,20 @@ class MarketDatabase:
         unique_tickers = cur.fetchone()[0]
         cur.execute("SELECT MIN(timestamp), MAX(timestamp) FROM price_snapshots")
         row = cur.fetchone()
+        earliest = row[0].isoformat() if row[0] else "N/A"
+        latest = row[1].isoformat() if row[1] else "N/A"
         return {
             "total_snapshots": snapshots,
             "total_markets": markets,
             "total_trades": trades,
             "unique_tickers_observed": unique_tickers,
-            "earliest_snapshot": row[0] or "N/A",
-            "latest_snapshot": row[1] or "N/A",
+            "earliest_snapshot": earliest,
+            "latest_snapshot": latest,
         }
 
     def close(self):
-        self.conn.close()
+        put_connection(self.conn)
+        self.conn = None
 
 
 # ============================================================================
@@ -288,7 +288,6 @@ _CATEGORY_PREFIXES = {
     # Companies & Tech
     "KXMETA": "Companies", "KXGROK": "Companies",
     "KXELON": "Science and Technology", "KXMARS": "Science and Technology",
-    "KXTEMP": "weather",
 }
 
 
@@ -319,6 +318,9 @@ class RESTRecorder:
         self.db = db
         self._event_categories: Dict[str, str] = {}  # event_ticker -> category
         self._category_cache_time = 0.0
+        self._last_prices: Dict[str, tuple] = {}  # ticker -> (yes_bid, yes_ask, volume)
+        self._last_market_state: Dict[str, tuple] = {}  # ticker -> (status, result, close_time, expiration_time)
+        self._market_state_seeded = False  # True after first DB seed
 
     def _refresh_event_categories(self):
         """Fetch event categories from Kalshi API (cached for 1 hour)."""
@@ -352,7 +354,7 @@ class RESTRecorder:
 
     def discover_all_markets(self) -> List[dict]:
         """
-        Paginate through ALL open markets on Kalshi.
+        Paginate through ALL open markets on Kalshi (exhaustive).
         Returns raw market dicts from the API.
         """
         all_markets = []
@@ -380,10 +382,79 @@ class RESTRecorder:
                 break
 
             # Rate limit courtesy
-            time.sleep(0.2)
+            time.sleep(0.15)
 
         logger.info(f"Discovered {len(all_markets)} open markets")
+
+        # --- NBA prop safety net ---
+        existing_tickers = {m.get("ticker", "") for m in all_markets}
+        nba_extra = self._discover_nba_props(existing_tickers)
+        if nba_extra:
+            all_markets.extend(nba_extra)
+            logger.info(f"NBA prop safety net: added {len(nba_extra)} extra markets")
+
         return all_markets
+
+    def _discover_nba_props(self, existing_tickers: set) -> List[dict]:
+        """
+        Targeted NBA player prop collection via series_ticker filter.
+        Returns only markets NOT already in existing_tickers.
+        """
+        NBA_SERIES = ["KXNBAPTS", "KXNBAREB", "KXNBAAST"]
+        extra = []
+
+        for series in NBA_SERIES:
+            cursor = None
+            for page in range(50):
+                try:
+                    resp = self.client.get_markets(
+                        limit=1000,
+                        cursor=cursor,
+                        series_ticker=series,
+                        status="open",
+                    )
+                except Exception as e:
+                    logger.debug(f"NBA prop fetch {series} page {page} failed: {e}")
+                    break
+
+                markets = resp.get("markets", [])
+                if not markets:
+                    break
+
+                for m in markets:
+                    t = m.get("ticker", "")
+                    if t and t not in existing_tickers:
+                        extra.append(m)
+                        existing_tickers.add(t)
+
+                cursor = resp.get("cursor")
+                if not cursor:
+                    break
+                time.sleep(0.15)
+
+        return extra
+
+    def _seed_market_states(self, tickers: list):
+        """Query DB for current states of these specific tickers to seed the change-detection cache."""
+        if not tickers:
+            return
+        try:
+            cur = self.db.conn.cursor()
+            cur.execute(
+                "SELECT ticker, status, result, close_time, expiration_time FROM markets WHERE ticker = ANY(%s)",
+                (tickers,),
+            )
+            rows = cur.fetchall()
+            for row in rows:
+                if isinstance(row, dict):
+                    self._last_market_state[row["ticker"]] = (
+                        row["status"], row["result"], row["close_time"], row["expiration_time"]
+                    )
+                else:
+                    self._last_market_state[row[0]] = (row[1], row[2], row[3], row[4])
+            logger.info(f"Seeded {len(rows)} market states from DB (of {len(tickers)} API tickers)")
+        except Exception as e:
+            logger.warning(f"Failed to seed market states: {e}")
 
     def record_snapshot(self) -> int:
         """
@@ -398,13 +469,18 @@ class RESTRecorder:
             logger.warning("No markets found in snapshot")
             return 0
 
+        # Seed state cache from DB on first cycle (targeted to current API tickers only)
+        if not self._market_state_seeded:
+            self._seed_market_states([m.get("ticker", "") for m in raw_markets if m.get("ticker")])
+            self._market_state_seeded = True
+
         snapshots = []
+        market_rows = []
         for m in raw_markets:
             ticker = m.get("ticker", "")
             if not ticker:
                 continue
 
-            # Kalshi API v2 returns dollar prices as "yes_bid_dollars" etc.
             yes_bid = float(m.get("yes_bid_dollars", 0) or 0)
             yes_ask = float(m.get("yes_ask_dollars", 0) or 0)
             no_bid = float(m.get("no_bid_dollars", 0) or 0)
@@ -415,44 +491,75 @@ class RESTRecorder:
             volume = int(float(m.get("volume_fp", 0) or 0))
             open_interest = int(float(m.get("open_interest_fp", 0) or 0))
 
-            snapshots.append({
-                "timestamp": now,
-                "ticker": ticker,
-                "event_ticker": m.get("event_ticker", ""),
-                "yes_bid": yes_bid,
-                "yes_ask": yes_ask,
-                "yes_price": mid,
-                "no_bid": no_bid,
-                "no_ask": no_ask,
-                "volume": volume,
-                "open_interest": open_interest,
-                "source": "rest",
-            })
+            # Only write snapshot if price/volume changed since last cycle
+            last = self._last_prices.get(ticker)
+            if last != (yes_bid, yes_ask, volume):
+                self._last_prices[ticker] = (yes_bid, yes_ask, volume)
+                snapshots.append({
+                    "timestamp": now,
+                    "ticker": ticker,
+                    "event_ticker": m.get("event_ticker", ""),
+                    "yes_bid": yes_bid,
+                    "yes_ask": yes_ask,
+                    "yes_price": mid,
+                    "no_bid": no_bid,
+                    "no_ask": no_ask,
+                    "volume": volume,
+                    "open_interest": open_interest,
+                    "source": "rest",
+                })
 
             # Category: prefer API event category, fallback to ticker prefix inference
             event_ticker = m.get("event_ticker", "")
             api_category = self._event_categories.get(event_ticker, "")
             category = api_category if api_category else _infer_category(ticker, m.get("title", ""))
 
-            # Upsert market metadata
-            self.db.upsert_market({
-                "ticker": ticker,
-                "event_ticker": event_ticker,
-                "title": m.get("title", ""),
-                "subtitle": m.get("subtitle", ""),
-                "category": category,
-                "status": m.get("status", ""),
-                "close_time": m.get("close_time", ""),
-                "expiration_time": m.get("expiration_time", ""),
-                "result": m.get("result", ""),
-            })
+            # Only upsert market metadata if state changed or market is new
+            mstatus = m.get("status", "")
+            mresult = m.get("result", "")
+            mclose = m.get("close_time", "")
+            mexpiry = m.get("expiration_time", "")
+            mstate = (mstatus, mresult, mclose, mexpiry)
+            if self._last_market_state.get(ticker) != mstate:
+                self._last_market_state[ticker] = mstate
+                market_rows.append({
+                    "ticker": ticker,
+                    "event_ticker": event_ticker,
+                    "title": m.get("title", ""),
+                    "subtitle": m.get("subtitle", ""),
+                    "category": category,
+                    "status": mstatus,
+                    "close_time": mclose,
+                    "expiration_time": mexpiry,
+                    "result": mresult,
+                })
 
+        # Bulk upsert only changed/new market metadata
+        if market_rows:
+            logger.info(f"Upserting {len(market_rows)} changed/new markets")
+            self.db.upsert_markets_batch(market_rows)
         # Batch insert all snapshots
         self.db.insert_snapshots_batch(snapshots)
         self.db.commit()
 
+        # Auto-prune old snapshots to prevent disk bloat
+        self._prune_old_snapshots()
+
         logger.info(f"Recorded {len(snapshots)} market snapshots")
         return len(snapshots)
+
+    def _prune_old_snapshots(self, keep_days: int = 3):
+        """
+        Delete price_snapshots older than keep_days to prevent DB bloat.
+        Called automatically after each record_snapshot().
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
+        try:
+            deleted = self.db.delete_old_snapshots(cutoff)
+            if deleted > 0:
+                logger.info(f"Pruned {deleted:,} old snapshots (before {cutoff[:10]})")
+        except Exception as e:
+            logger.debug(f"Snapshot prune error: {e}")
 
     def run_polling(self, interval: int = DEFAULT_POLL_INTERVAL, max_cycles: int = None):
         """
@@ -503,7 +610,7 @@ class WSRecorder:
     Flow:
     1. Discover all open markets via REST
     2. Subscribe to ticker + trade channels for all markets
-    3. Buffer updates and flush to SQLite periodically
+    3. Buffer updates and flush to PostgreSQL periodically
     4. Re-discover markets periodically to catch new ones
     """
 
@@ -548,16 +655,13 @@ class WSRecorder:
 
         logger.info(f"Subscribing to {len(tickers)} markets via WebSocket")
 
-        # Kalshi WebSocket has a limit on subscription size.
-        # We'll subscribe in batches if needed.
-        # For now, subscribe to all (Kalshi allows large subscriptions).
         ws = KalshiWebSocket(self.config)
 
         def on_tick(update):
             self._buffer.append({
                 "timestamp": update.timestamp,
                 "ticker": update.market_ticker,
-                "event_ticker": "",  # not available in WS tick
+                "event_ticker": "",
                 "yes_bid": update.yes_bid,
                 "yes_ask": update.yes_ask,
                 "yes_price": update.yes_price,
@@ -580,7 +684,6 @@ class WSRecorder:
         ws.on_ticker(on_tick)
         ws.on_trade(on_trade)
 
-        # Start flushing task
         flush_task = asyncio.create_task(self._flush_loop())
 
         try:
@@ -597,7 +700,7 @@ class WSRecorder:
             self._flush_now()  # final flush
 
     async def _flush_loop(self):
-        """Periodically flush buffered data to SQLite."""
+        """Periodically flush buffered data to PostgreSQL."""
         while self._running:
             await asyncio.sleep(WS_FLUSH_INTERVAL)
             self._flush_now()
@@ -625,7 +728,7 @@ class WSRecorder:
 
 def migrate_legacy_jsonl(db: MarketDatabase) -> int:
     """
-    Migrate existing price_observations.jsonl into SQLite.
+    Migrate existing price_observations.jsonl into PostgreSQL.
     Maps old format fields to new schema.
     """
     if not LEGACY_JSONL.exists():
@@ -646,12 +749,7 @@ def migrate_legacy_jsonl(db: MarketDatabase) -> int:
                 errors += 1
                 continue
 
-            # Map old format → new schema
-            # Old: team, quality, deficit, period, comeback_prob,
-            #      kalshi_price, kalshi_bid, kalshi_ask, kalshi_spread,
-            #      game, edge, is_alert, timestamp
             ticker = record.get("game", f"legacy-{line_num}")
-            # Clean up: use game description as a pseudo-ticker
             ticker = ticker.replace(" ", "-").replace("/", "-")[:100] if ticker else f"legacy-{line_num}"
 
             snapshot = {
@@ -702,7 +800,7 @@ def main():
     )
     parser.add_argument(
         "--migrate", action="store_true",
-        help="Migrate legacy price_observations.jsonl into SQLite"
+        help="Migrate legacy price_observations.jsonl into PostgreSQL"
     )
     parser.add_argument(
         "--stats", action="store_true",
@@ -715,17 +813,14 @@ def main():
 
     args = parser.parse_args()
 
-    # Logging
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    # Database
     db = MarketDatabase()
 
-    # Stats only
     if args.stats:
         stats = db.get_stats()
         print("=" * 50)
@@ -736,7 +831,6 @@ def main():
         db.close()
         return
 
-    # Migration
     if args.migrate:
         print("Migrating legacy data...")
         count = migrate_legacy_jsonl(db)
@@ -747,7 +841,6 @@ def main():
         db.close()
         return
 
-    # Config
     config = KalshiConfig.from_env()
     if args.prod:
         config.use_demo = False
@@ -757,12 +850,11 @@ def main():
     print("=" * 60)
     print(f"  Mode:     {args.mode}")
     print(f"  Env:      {'PRODUCTION' if not config.use_demo else 'DEMO'}")
-    print(f"  Database: {DB_PATH}")
+    print(f"  Database: PostgreSQL warmachine")
     if args.mode == "rest":
         print(f"  Interval: {args.interval}s")
     print()
 
-    # Graceful shutdown
     def handle_signal(sig, frame):
         logger.info("Shutdown signal received. Saving data...")
         db.commit()
@@ -774,7 +866,6 @@ def main():
 
     try:
         if args.mode == "snapshot":
-            # Single snapshot
             client = create_client(config)
             recorder = RESTRecorder(client, db)
             count = recorder.record_snapshot()
@@ -784,7 +875,6 @@ def main():
                 print(f"  {key}: {val}")
 
         elif args.mode == "rest":
-            # Continuous REST polling
             client = create_client(config)
             recorder = RESTRecorder(client, db)
             recorder.run_polling(
@@ -793,7 +883,6 @@ def main():
             )
 
         elif args.mode == "ws":
-            # WebSocket streaming
             ws_recorder = WSRecorder(config, db)
             asyncio.run(ws_recorder.run(duration_seconds=args.duration))
 

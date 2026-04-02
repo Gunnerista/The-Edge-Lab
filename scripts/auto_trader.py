@@ -53,6 +53,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 import requests
+from db import get_connection, put_connection
 from kalshi_client import KalshiConfig, create_client
 from signal_engine import SignalEngine, Signal, net_ev, KALSHI_FEE_RATE
 from trade_engine import TradeEngine, TradeOrder
@@ -829,13 +830,14 @@ class AutoTrader:
     def _hours_to_settlement_for_ticker(self, ticker: str) -> float:
         """Get hours to settlement for a ticker from DB."""
         try:
-            import sqlite3 as _sqlite3
-            conn = _sqlite3.connect(str(PROJECT_ROOT / "data" / "market_data.db"))
-            row = conn.execute(
-                "SELECT expiration_time, close_time FROM markets WHERE ticker = ?",
+            conn = get_connection()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT expiration_time, close_time FROM markets WHERE ticker = %s",
                 (ticker,)
-            ).fetchone()
-            conn.close()
+            )
+            row = cur.fetchone()
+            put_connection(conn)
             if not row:
                 return 999.0
             exp = row[0] or row[1] or ""

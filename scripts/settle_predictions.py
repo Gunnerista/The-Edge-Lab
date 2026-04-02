@@ -196,16 +196,28 @@ def settle(target_date: str = None):
 
 
 def print_report(preds: list[dict] = None):
-    """Print accuracy report from prediction log."""
+    """Print accuracy report from prediction log.
+
+    Calibration & edge performance are computed on source="auto" only.
+    If no auto entries exist yet, falls back to all entries with a warning.
+    """
     if preds is None:
         preds = load_predictions()
 
     settled = [p for p in preds if p.get("settled", False)]
     unsettled = [p for p in preds if not p.get("settled", False)]
 
+    # Calibration subset: system-generated only (for unbiased forward test metrics)
+    # "auto" = scheduler, "auto-cli" = CLI batch run. Excludes "manual" (hand-entered bets).
+    AUTO_SOURCES = {"auto", "auto-cli"}
+    auto_settled = [p for p in settled if p.get("source") in AUTO_SOURCES]
+    cal_set = auto_settled if auto_settled else settled
+    cal_label = "auto+auto-cli" if auto_settled else "all (no auto entries yet)"
+
     print()
     print("=" * 85)
     print(f"  FORWARD TEST REPORT - {len(settled)} settled / {len(unsettled)} pending")
+    print(f"  Calibration source: {cal_label} ({len(cal_set)} entries)")
     print("=" * 85)
 
     if not settled:
@@ -213,7 +225,7 @@ def print_report(preds: list[dict] = None):
         print()
         return
 
-    # Overall accuracy
+    # Overall accuracy (all entries)
     correct = [p for p in settled if p.get("model_correct")]
     accuracy = len(correct) / len(settled) * 100
 
@@ -242,23 +254,33 @@ def print_report(preds: list[dict] = None):
             )
         print()
 
-    # Calibration buckets
-    print("  --- Calibration ---")
+    # Calibration buckets (auto-only)
+    print(f"  --- Calibration (source={cal_label}) ---")
     buckets = [(0, 0.2), (0.2, 0.4), (0.4, 0.6), (0.6, 0.8), (0.8, 1.01)]
     for lo, hi in buckets:
-        bucket = [p for p in settled if lo <= p["model_prob"] < hi]
+        bucket = [p for p in cal_set if lo <= p["model_prob"] < hi]
         if not bucket:
             continue
         hit_rate = sum(1 for p in bucket if p.get("actual_result") == "yes") / len(bucket)
         avg_prob = sum(p["model_prob"] for p in bucket) / len(bucket)
         print(f"  model_prob [{lo:.0%}-{hi:.0%}): n={len(bucket):2d}, hit_rate={hit_rate:.1%}, avg_model={avg_prob:.1%}")
 
-    # Edge-based: did positive edge props outperform?
+    # Brier score (auto-only)
+    brier_set = [p for p in cal_set if p.get("model_prob") is not None]
+    if brier_set:
+        brier_sum = sum(
+            (p["model_prob"] - (1.0 if p.get("actual_result") == "yes" else 0.0)) ** 2
+            for p in brier_set
+        )
+        brier = brier_sum / len(brier_set)
+        print(f"  Brier score: {brier:.4f} (n={len(brier_set)}) {'PASS' if brier < 0.20 else 'FAIL'}")
+
+    # Edge-based: did positive edge props outperform? (auto-only)
     print()
-    print("  --- Edge Performance ---")
-    pos_edge = [p for p in settled if (p.get("edge") or 0) > 0.05]
-    neg_edge = [p for p in settled if (p.get("edge") or 0) < -0.05]
-    neutral = [p for p in settled if -0.05 <= (p.get("edge") or 0) <= 0.05]
+    print(f"  --- Edge Performance (source={cal_label}) ---")
+    pos_edge = [p for p in cal_set if (p.get("edge") or 0) > 0.05]
+    neg_edge = [p for p in cal_set if (p.get("edge") or 0) < -0.05]
+    neutral = [p for p in cal_set if -0.05 <= (p.get("edge") or 0) <= 0.05]
 
     for label, group in [("Edge > +5%", pos_edge), ("|Edge| <= 5%", neutral), ("Edge < -5%", neg_edge)]:
         if not group:

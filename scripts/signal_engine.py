@@ -31,7 +31,6 @@ Usage:
 import sys
 import json
 import math
-import sqlite3
 import logging
 import argparse
 import time
@@ -51,11 +50,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+from db import get_connection, put_connection
 
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DB_PATH = PROJECT_ROOT / "data" / "market_data.db"
 
 # ============================================================================
 # Kalshi Fee Structure
@@ -151,18 +150,31 @@ class SignalEngine:
     """
 
     # Minimum thresholds
-    MIN_EDGE = 0.03             # 3% edge after fees
+    MIN_EDGE = 0.20             # default (used by non-NBA detectors)
+    PROP_MIN_EDGE = {           # per-prop-type edge thresholds for NBA prop detector
+        "assists": 0.15,
+        "points":  0.25,
+        "rebounds": 0.25,
+        "threes":  0.25,
+        "steals":  0.25,
+        "blocks":  0.25,
+    }
     MIN_NET_EV_CENTS = 1.0      # 1 cent minimum net EV
     MAX_SPREAD_CENTS = 15       # won't trade wider than 15c
     MIN_VOLUME = 0              # 0 for now (many markets are new)
 
-    def __init__(self, db_path: Path = DB_PATH, max_settlement_hours: int = 72):
-        self.conn = sqlite3.connect(str(db_path))
-        self.conn.row_factory = sqlite3.Row
+    def __init__(self, max_settlement_hours: int = 72):
+        self.conn = get_connection(dict_cursor=True)
         self.max_settlement_hours = max_settlement_hours
 
     def _query(self, sql: str, params: tuple = ()) -> List[dict]:
-        return [dict(r) for r in self.conn.execute(sql, params).fetchall()]
+        try:
+            cur = self.conn.cursor()
+            cur.execute(sql, params)
+            return [dict(r) for r in cur.fetchall()]
+        except Exception:
+            self.conn.rollback()
+            raise
 
     def _apply_settlement_filter(self, rows: List[dict]) -> List[dict]:
         """Filter to markets settling within max_settlement_hours."""
@@ -180,18 +192,50 @@ class SignalEngine:
 
     def _get_latest_prices(self) -> List[dict]:
         """Get the most recent price snapshot for each ticker (settlement-filtered)."""
-        rows = self._query("""
-            SELECT s.ticker, s.yes_bid, s.yes_ask, s.yes_price,
-                   s.no_bid, s.no_ask, s.volume, s.open_interest, s.timestamp,
-                   m.title, m.category, m.sub_category, m.market_type,
-                   m.liquidity_grade, m.expiration_time, m.close_time
-            FROM price_snapshots s
-            JOIN markets m ON s.ticker = m.ticker
-            WHERE s.rowid IN (
-                SELECT MAX(rowid) FROM price_snapshots GROUP BY ticker
-            )
-            AND s.yes_bid > 0 AND s.yes_ask > 0
-        """)
+        # Step 1: get max timestamp
+        cur = self.conn.cursor()
+        cur.execute("SELECT MAX(timestamp) AS max_ts FROM price_snapshots")
+        row = cur.fetchone()
+        if not row or not row["max_ts"]:
+            return []
+        max_ts = row["max_ts"]
+
+        # Step 2: get latest snapshot per ticker from recent batch (plain cursor for speed)
+        import psycopg2
+        plain_cur = self.conn.cursor(cursor_factory=psycopg2.extensions.cursor)
+        plain_cur.execute("""
+            SELECT DISTINCT ON (ticker)
+                   ticker, yes_bid, yes_ask, yes_price,
+                   no_bid, no_ask, volume, open_interest, timestamp
+            FROM price_snapshots
+            WHERE timestamp >= %s - INTERVAL '10 minutes'
+              AND yes_bid > 0 AND yes_ask > 0
+            ORDER BY ticker, id DESC
+        """, (max_ts,))
+        snapshots = {r[0]: r for r in plain_cur.fetchall()}
+        if not snapshots:
+            return []
+
+        # Step 3: join with markets for active tickers
+        plain_cur.execute("""
+            SELECT ticker, title, category, sub_category, market_type,
+                   liquidity_grade, expiration_time, close_time
+            FROM markets
+            WHERE ticker = ANY(%s) AND status = 'active'
+        """, (list(snapshots.keys()),))
+
+        rows = []
+        for m in plain_cur.fetchall():
+            t = m[0]
+            s = snapshots[t]
+            rows.append({
+                "ticker": t, "yes_bid": s[1], "yes_ask": s[2], "yes_price": s[3],
+                "no_bid": s[4], "no_ask": s[5], "volume": s[6],
+                "open_interest": s[7], "timestamp": s[8],
+                "title": m[1], "category": m[2], "sub_category": m[3],
+                "market_type": m[4], "liquidity_grade": m[5],
+                "expiration_time": m[6], "close_time": m[7],
+            })
         return self._apply_settlement_filter(rows)
 
     def _get_price_history(self, ticker: str, limit: int = 50) -> List[dict]:
@@ -199,8 +243,8 @@ class SignalEngine:
         return self._query(
             """SELECT timestamp, yes_bid, yes_ask, yes_price, volume, open_interest
                FROM price_snapshots
-               WHERE ticker = ? AND yes_price > 0
-               ORDER BY timestamp DESC LIMIT ?""",
+               WHERE ticker = %s AND yes_price > 0
+               ORDER BY timestamp DESC LIMIT %s""",
             (ticker, limit),
         )
 
@@ -438,14 +482,16 @@ class SignalEngine:
     @staticmethod
     def _hours_to_settlement(ticker: str, conn) -> float:
         """Calculate hours until settlement for a market."""
-        row = conn.execute(
-            "SELECT expiration_time, close_time FROM markets WHERE ticker = ?",
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT expiration_time, close_time FROM markets WHERE ticker = %s",
             (ticker,)
-        ).fetchone()
+        )
+        row = cur.fetchone()
         if not row:
             return 999.0
 
-        exp = row[0] or row[1] or ""
+        exp = row["expiration_time"] or row["close_time"] or ""
         if not exp:
             return 999.0
 
@@ -475,7 +521,8 @@ class SignalEngine:
             SELECT ticker, COUNT(*) as cnt
             FROM price_snapshots
             WHERE yes_price > 0
-            GROUP BY ticker HAVING cnt >= 5
+              AND timestamp >= (SELECT MAX(timestamp) FROM price_snapshots) - INTERVAL '24 hours'
+            GROUP BY ticker HAVING COUNT(*) >= 5
         """)
 
         for row in tickers_with_history:
@@ -552,7 +599,7 @@ class SignalEngine:
 
             # Get market info
             market = self._query(
-                "SELECT title, category, sub_category FROM markets WHERE ticker = ?",
+                "SELECT title, category, sub_category FROM markets WHERE ticker = %s",
                 (ticker,)
             )
             if not market:
@@ -662,30 +709,43 @@ class SignalEngine:
 
         signals = []
 
-        # Find NBA player prop markets using exact Kalshi ticker prefixes
-        # from market_classifier.py:
-        #   KXNBAPTS = points, KXNBAREB = rebounds, KXNBAAST = assists
-        #   KXNBA3PT = threes, KXNBASTL = steals, KXNBABLK = blocks
-        nba_markets = self._query("""
-            SELECT m.ticker, m.title, m.category, m.sub_category, m.market_type,
-                   m.expiration_time, m.close_time,
-                   s.yes_bid, s.yes_ask, s.yes_price, s.volume
-            FROM markets m
-            JOIN price_snapshots s ON m.ticker = s.ticker
-            WHERE (
-                m.ticker LIKE 'KXNBAPTS%'
-                OR m.ticker LIKE 'KXNBAREB%'
-                OR m.ticker LIKE 'KXNBAAST%'
-                OR m.ticker LIKE 'KXNBA3PT%'
-                OR m.ticker LIKE 'KXNBASTL%'
-                OR m.ticker LIKE 'KXNBABLK%'
-            )
-            AND s.yes_bid > 0 AND s.yes_ask > 0
-            AND s.rowid IN (SELECT MAX(rowid) FROM price_snapshots GROUP BY ticker)
-            AND m.status = 'open'
-        """)
+        # Query NBA prop markets directly by ticker date pattern.
+        # Kalshi expiration_time for NBA props is ~14 days out; settlement filter kills all.
+        # Use same approach as forward_test.get_active_props(): ticker LIKE date pattern.
+        from datetime import date as _date
+        try:
+            from tz import ET
+            today = datetime.now(ET).date()
+        except Exception:
+            today = datetime.now(timezone.utc).date()
 
-        nba_markets = self._apply_settlement_filter(nba_markets)
+        NBA_PREFIXES = ["KXNBAPTS", "KXNBAREB", "KXNBAAST", "KXNBA3PT", "KXNBASTL", "KXNBABLK"]
+        dates = [today, today + timedelta(days=1)]
+
+        def _date_to_pattern(d: _date) -> str:
+            return f"{str(d.year)[-2:]}{d.strftime('%b').upper()}{d.day}"
+
+        nba_markets_dict = {}
+        cur = self.conn.cursor()
+        for d in dates:
+            dp = _date_to_pattern(d)
+            for pfx in NBA_PREFIXES:
+                cur.execute("""
+                    SELECT m.ticker, m.title, m.category, m.sub_category, m.market_type,
+                           m.liquidity_grade, m.expiration_time, m.close_time,
+                           p.yes_bid, p.yes_ask, p.yes_price, p.no_bid, p.no_ask,
+                           p.volume, p.open_interest, p.timestamp
+                    FROM markets m
+                    LEFT JOIN price_snapshots p ON m.ticker = p.ticker
+                      AND p.id = (SELECT MAX(id) FROM price_snapshots WHERE ticker = m.ticker)
+                    WHERE m.ticker LIKE %s
+                      AND m.status = 'active'
+                      AND p.yes_bid > 0 AND p.yes_ask > 0
+                """, (f"{pfx}-{dp}%",))
+                for row in cur.fetchall():
+                    nba_markets_dict[row["ticker"]] = dict(row)
+
+        nba_markets = list(nba_markets_dict.values())
 
         if not nba_markets:
             logger.debug("[SignalEngine] No NBA prop markets found")
@@ -742,8 +802,9 @@ class SignalEngine:
             ev = net_ev(model_prob, entry, side)
             edge = model_prob - breakeven_prob(entry)
 
-            # Only signal if edge meets threshold
-            if ev <= self.MIN_NET_EV_CENTS / 100 or edge < self.MIN_EDGE:
+            # Only signal if edge meets per-prop threshold
+            prop_min_edge = self.PROP_MIN_EDGE.get(prediction.prop_type, 0.25)
+            if ev <= self.MIN_NET_EV_CENTS / 100 or edge < prop_min_edge:
                 continue
 
             hours_to_settle = self._hours_to_settlement(ticker, self.conn)
@@ -815,29 +876,22 @@ class SignalEngine:
         """
         signals = []
 
-        # Find event tickers with multiple markets
-        events = self._query("""
-            SELECT m.event_ticker, COUNT(DISTINCT m.ticker) as market_count
-            FROM markets m
-            JOIN price_snapshots s ON m.ticker = s.ticker
-            WHERE m.event_ticker != '' AND s.yes_price > 0
-            GROUP BY m.event_ticker
-            HAVING market_count >= 2
-        """)
+        # Reuse already-fetched latest prices (optimized 3-step query)
+        latest = self._get_latest_prices()
+        if not latest:
+            return signals
 
-        for event in events:
-            evt = event["event_ticker"]
+        # Group by event_ticker in Python
+        from collections import defaultdict
+        by_event: dict = defaultdict(list)
+        for row in latest:
+            evt = row.get("event_ticker", "")
+            if evt and row.get("yes_price", 0) > 0:
+                by_event[evt].append(row)
 
-            # Get all markets in this event with latest prices
-            markets = self._query("""
-                SELECT m.ticker, m.title, m.category, m.sub_category,
-                       s.yes_bid, s.yes_ask, s.yes_price, s.volume
-                FROM markets m
-                JOIN price_snapshots s ON m.ticker = s.ticker
-                WHERE m.event_ticker = ? AND s.yes_price > 0
-                AND s.rowid IN (SELECT MAX(rowid) FROM price_snapshots WHERE ticker = m.ticker)
-                ORDER BY s.yes_price DESC
-            """, (evt,))
+        for evt, markets in by_event.items():
+            if len(markets) < 2:
+                continue
 
             if len(markets) < 2:
                 continue
@@ -903,18 +957,13 @@ class SignalEngine:
         """
         signals = []
 
-        # Find markets where latest volume significantly exceeds historical
-        # (Need multiple snapshots to compare)
-        rows = self._query("""
-            SELECT s.ticker, m.title, m.category, m.sub_category,
-                   s.yes_bid, s.yes_ask, s.yes_price, s.volume, s.open_interest
-            FROM price_snapshots s
-            JOIN markets m ON s.ticker = m.ticker
-            WHERE s.volume > 100 AND s.yes_bid > 0 AND s.yes_ask > 0
-            AND s.rowid IN (SELECT MAX(rowid) FROM price_snapshots GROUP BY ticker)
-            ORDER BY s.volume DESC
-            LIMIT 20
-        """)
+        # Reuse already-fetched latest prices (optimized 3-step query)
+        latest = self._get_latest_prices()
+        rows = sorted(
+            [r for r in latest if r.get("volume", 0) > 100 and r.get("yes_bid", 0) > 0 and r.get("yes_ask", 0) > 0],
+            key=lambda r: r.get("volume", 0),
+            reverse=True,
+        )[:20]
 
         for row in rows:
             spread_cents = (row["yes_ask"] - row["yes_bid"]) * 100
@@ -1004,7 +1053,8 @@ class SignalEngine:
         return deduped
 
     def close(self):
-        self.conn.close()
+        put_connection(self.conn)
+        self.conn = None
 
 
 # ============================================================================

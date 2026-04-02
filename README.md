@@ -39,11 +39,13 @@ This repo is the flight recorder. Every model built, every backtest run, every l
 
 | Milestone | Status |
 |---|---|
-| NBA probability model (XGBoost) | ✅ Brier 0.1852 OOS |
-| Fee-adjusted ROI positive @ edge >10% | ✅ Backtest passed |
-| Forward test automation (daily cron) | ✅ Running |
-| 100-prediction forward test validation | 🔄 In progress |
-| Live transition | ⏳ Pending validation |
+| NBA probability model (XGBoost) | ✅ Brier 0.1681 (999 predictions) |
+| Fee-adjusted ROI positive @ edge >20% | ✅ +13.0% ROI (forward test) |
+| Forward test automation (daily cron) | ✅ Running (NBA schedule-aware) |
+| Prop-type differential strategy | ✅ Assists +17.2% ROI identified |
+| PostgreSQL migration | ✅ 18.5M rows migrated |
+| 100-prediction v3 config validation | 🔄 In progress |
+| Live transition ($300) | ⏳ Pending v3 validation |
 
 **Stack**: Python · XGBoost · Kalshi API · Kelly Criterion
 **Key insight**: The model doesn't need to be perfect. It needs to be *less wrong* than the market, after fees.
@@ -73,6 +75,7 @@ Built as a standalone HTML dashboard — no server required.
 | Date | Entry | Tags |
 |---|---|---|
 | [2026-03-28](logs/2026-03-28.md) | Day 1: System audit complete. Swapped logistic regression → XGBoost. Backtest passed. Forward test automated. The journey begins. | `betting-system` `model` `milestone` |
+| [2026-04-02](logs/2026-04-02-phase1-validation.md) | Phase 1 Validation: 999 predictions settled. Brier 0.1681 ✅. Discovered assists market edge (+17.2% ROI). Killed the Kalshi expiration bug. Migrated to PostgreSQL. Rebuilt calibration. System works — when pointed at the right targets. | `validation` `calibration` `infrastructure` `milestone` |
 
 📁 **[Browse all logs →](logs/)**
 

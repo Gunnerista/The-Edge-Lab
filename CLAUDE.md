@@ -186,12 +186,11 @@ MAX_KALSHI_PRICE = 0.95   # 95c 초과 → 확실 결과 (엣지 없음, 스킵)
 
 | 날짜 | 변경 내용 |
 |------|-----------|
-| 2026-03-29 | 워크트리 환경: `D:\Projects\sports-betting-system` |
+| 2026-04-03 | 프로젝트 경로 확정: `C:\Users\Dell\Desktop\Projects\sports-betting-system` (D드라이브 참조 제거) |
 | 2026-03-29 | `prediction_log.jsonl` 백업: `.bak.20260329_005700` |
 | 2026-03-29 | SQLite timeout=30 (전체 적용) |
 | 2026-03-29 | settle 재시도: 60초×3회 (DB 잠금 대응) |
 | 2026-03-29 | pagination MAX_PAGES=200 (200K 마켓 처리) |
-| 2026-03-28 | C드라이브 → D드라이브 이전 |
 | 2026-03-28 | PAPER_TRADING = True (실매매 중단, 전략 검증 중) |
 
 ---

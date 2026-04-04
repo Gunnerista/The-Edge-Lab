@@ -729,7 +729,7 @@ def _startup_catchup_forward_test():
         # Build ticker date pattern (e.g., 26MAR28 for 2026-03-28)
         yy = str(now.year)[-2:]
         mon = now.strftime("%b").upper()
-        dd = str(now.day)
+        dd = f"{now.day:02d}"
         pattern = f"KXNBAPTS-{yy}{mon}{dd}%"
         cur = conn.cursor()
         cur.execute(
@@ -926,7 +926,7 @@ def main():
             if _now_et() >= shutdown_at:
                 if not player_report_sent:
                     player_report_sent = True
-                    today_str_report = _now_et().strftime("%Y-%m-%d")
+                    today_str_report = first_tipoff.strftime("%Y-%m-%d")
                     logger.info("[Schedule] Sending daily player report...")
                     try:
                         send_player_report(today_str_report)

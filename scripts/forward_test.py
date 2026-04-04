@@ -39,9 +39,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 LOG_FILE = PROJECT_ROOT / "data" / "prediction_log.jsonl"
 
 # Prop types we model
-PROP_PREFIXES = ["KXNBAPTS", "KXNBAREB", "KXNBAAST"]
-PROP_TYPE_MAP = {"KXNBAPTS": "points", "KXNBAREB": "rebounds", "KXNBAAST": "assists"}
-CONFIG_VERSION = "v3_prop_edge"
+PROP_PREFIXES = ["KXNBAPTS", "KXNBAREB"]  # assists disabled (v4: -27.8% ROI)
+PROP_TYPE_MAP = {"KXNBAPTS": "points", "KXNBAREB": "rebounds"}
+CONFIG_VERSION = "v4_edge_optimized"
 
 # Maps The Odds API full team name → Kalshi 3-letter abbreviation
 _TEAM_NAME_TO_ABBR = {
@@ -154,7 +154,7 @@ def date_to_ticker_pattern(d: date) -> str:
     """Convert date to ticker date segment pattern: 26MAR28 for 2026-03-28."""
     yy = str(d.year)[-2:]
     mon = d.strftime("%b").upper()
-    dd = str(d.day)
+    dd = f"{d.day:02d}"
     return f"{yy}{mon}{dd}"
 
 

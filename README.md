@@ -76,6 +76,7 @@ Built as a standalone HTML dashboard — no server required.
 |---|---|---|
 | [2026-03-28](logs/2026-03-28.md) | Day 1: System audit complete. Swapped logistic regression → XGBoost. Backtest passed. Forward test automated. The journey begins. | `betting-system` `model` `milestone` |
 | [2026-04-02](logs/2026-04-02-phase1-validation.md) | Phase 1 Validation: 999 predictions settled. Brier 0.1681 ✅. Discovered assists market edge (+17.2% ROI). Killed the Kalshi expiration bug. Migrated to PostgreSQL. Rebuilt calibration. System works — when pointed at the right targets. | `validation` `calibration` `infrastructure` `milestone` |
+| [2026-04-04](logs/2026-04-04-the-price-was-wrong.md) | The Price Was Wrong: Entry price bug fix, NO betting activation, v3 156-bet diagnosis, v4 config rebuild | `bug-fix` `entry-price` `no-betting` `v3-diagnosis` `v4-config` `edge-threshold` |
 
 📁 **[Browse all logs →](logs/)**
 

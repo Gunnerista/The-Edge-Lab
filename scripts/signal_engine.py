@@ -152,13 +152,15 @@ class SignalEngine:
     # Minimum thresholds
     MIN_EDGE = 0.20             # default (used by non-NBA detectors)
     PROP_MIN_EDGE = {           # per-prop-type edge thresholds for NBA prop detector
-        "assists": 0.15,
+        "assists": None,        # disabled (43.8% win rate, -27.8% ROI)
         "points":  0.25,
-        "rebounds": 0.25,
+        "rebounds": 0.20,       # relaxed 0.25→0.20 (profitable prop)
         "threes":  0.25,
         "steals":  0.25,
         "blocks":  0.25,
     }
+    YES_EDGE_PREMIUM = 0.05     # YES bets require MIN_EDGE + 0.05 extra
+    GLOBAL_MIN_EDGE  = 0.15     # hard floor regardless of prop type
     MIN_NET_EV_CENTS = 1.0      # 1 cent minimum net EV
     MAX_SPREAD_CENTS = 15       # won't trade wider than 15c
     MIN_VOLUME = 0              # 0 for now (many markets are new)
@@ -789,11 +791,11 @@ class SignalEngine:
 
             if model_prob_yes > market_prob_yes:
                 side = "yes"
-                entry = yes_bid  # buy YES at bid
+                entry = yes_ask  # pay ask to buy YES
                 model_prob = model_prob_yes
             else:
                 side = "no"
-                entry = 1 - yes_ask  # buy NO
+                entry = 1 - yes_bid  # NO ask = 1 - yes_bid
                 model_prob = 1 - model_prob_yes
 
             if entry <= 0 or entry >= 1:
@@ -804,7 +806,10 @@ class SignalEngine:
 
             # Only signal if edge meets per-prop threshold
             prop_min_edge = self.PROP_MIN_EDGE.get(prediction.prop_type, 0.25)
-            if ev <= self.MIN_NET_EV_CENTS / 100 or edge < prop_min_edge:
+            if prop_min_edge is None:  # prop type disabled
+                continue
+            effective_min = max(prop_min_edge + (self.YES_EDGE_PREMIUM if side == "yes" else 0), self.GLOBAL_MIN_EDGE)
+            if ev <= self.MIN_NET_EV_CENTS / 100 or edge < effective_min:
                 continue
 
             hours_to_settle = self._hours_to_settlement(ticker, self.conn)

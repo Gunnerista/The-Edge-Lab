@@ -70,6 +70,18 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PAPER_TRADES_FILE = PROJECT_ROOT / "data" / "paper_trades.jsonl"
 
+
+def should_place_bet(prop_type: str, side: str, calculated_edge: float) -> bool:
+    """v4_edge_optimized: prop type gate + side-aware edge threshold."""
+    prop_min = SignalEngine.PROP_MIN_EDGE.get(prop_type, 0.25)
+    if prop_min is None:  # prop type disabled
+        return False
+    if side == "yes":
+        prop_min += SignalEngine.YES_EDGE_PREMIUM
+    effective_min = max(prop_min, SignalEngine.GLOBAL_MIN_EDGE)
+    return calculated_edge >= effective_min
+
+
 def _get_webhook():
     return os.environ.get("DISCORD_WEBHOOK_URL", "")
 
@@ -329,12 +341,12 @@ class AutoTrader:
                 )
                 continue
 
-            # Filter: edge threshold (uses tuned param)
-            tuned_min_edge = get_params().get("min_edge")
-            if sig.edge < tuned_min_edge:
+            # Filter: v4 prop/side-aware edge gate
+            prop_type = sig.data.get("prop_type", "")
+            if not should_place_bet(prop_type, sig.side, sig.edge):
                 self.learn.signal_skipped(
                     sig.ticker, sig.signal_type,
-                    f"edge {sig.edge*100:.1f}% < {tuned_min_edge*100:.0f}% threshold",
+                    f"should_place_bet=False prop={prop_type} side={sig.side} edge={sig.edge*100:.1f}%",
                     price=sig.entry_price, edge=sig.edge,
                 )
                 continue
@@ -350,10 +362,10 @@ class AutoTrader:
                 )
                 continue
 
-            # Filter: edge must cover spread cost (edge >= spread * 2)
-            # Wider spreads eat into profit, so edge needs to be proportionally larger
+            # Filter: edge must cover spread cost (YES only)
+            # NO bets: PROP_MIN_EDGE in signal_engine already ensures sufficient edge
             spread_ratio = spread_cents / 100
-            if sig.edge < spread_ratio * 2:
+            if sig.side == "yes" and sig.edge < spread_ratio * 2:
                 self.learn.signal_skipped(
                     sig.ticker, sig.signal_type,
                     f"edge {sig.edge*100:.1f}% < spread cost {spread_ratio*200:.1f}% (2x spread rule)",

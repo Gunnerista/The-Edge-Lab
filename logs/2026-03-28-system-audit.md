@@ -74,3 +74,8 @@ Set up daily cron job:
 
 *"The market can stay irrational longer than you can stay solvent." — Keynes*
 *"That's why we use Kelly sizing." — Me, probably*
+
+
+---
+
+[Next: Chapter 2 — Phase 1 Validation →](./2026-04-02-phase1-validation.md)

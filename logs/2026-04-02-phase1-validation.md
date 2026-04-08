@@ -229,3 +229,8 @@ Config:            v3_prop_edge (differential thresholds)
 
 *"In theory, there is no difference between theory and practice. In practice, there is."*
 *— Yogi Berra (probably while looking at a Brier Score)*
+
+
+---
+
+[← Previous: Chapter 1 — System Audit](./2026-03-28-system-audit.md) | [Next: Chapter 3 — The Price Was Wrong →](./2026-04-04-the-price-was-wrong.md)

@@ -201,3 +201,8 @@ The model works. The calibration is real. Now we need the config to let it make 
 
 *Previous: [Phase 1 Validation — The First 1,000 Predictions](2026-04-02-phase1-validation.md)*
 *Config: `v4_edge_optimized` | Deployed: 2026-04-04*
+
+
+---
+
+[← Previous: Chapter 2 — Phase 1 Validation](./2026-04-02-phase1-validation.md) | [Next: Chapter 4 — Three Days, Four Bugs →](./2026-04-09-three-days-four-bugs.md)

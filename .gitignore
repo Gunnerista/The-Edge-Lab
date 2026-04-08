@@ -1,32 +1,32 @@
-# Data & secrets
+# === Sensitive: NEVER commit ===
+CLAUDE.md
+CLAUDE_CODE_MASTER_INSTRUCTIONS.md
+scripts/
+requirements.txt
+*.bat
+*.xml
 *.json
 *.csv
 *.env
 .env*
 secrets/
 data/
+tuned_params.json
+calibration_state.json
 
-# Python
+# === Python ===
 __pycache__/
 *.py[cod]
-*.egg-info/
-dist/
-build/
+*.pyc
 venv/
 .venv/
+.ipynb_checkpoints/
 
-# OS
+# === IDE ===
+.vscode/
+.idea/
 .DS_Store
 Thumbs.db
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# Logs (keep markdown logs, ignore runtime logs)
+# === Logs ===
 *.log
-
-# Jupyter
-.ipynb_checkpoints/

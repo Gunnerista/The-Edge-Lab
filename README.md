@@ -1,119 +1,80 @@
 <h1 align="center">THE EDGE LAB</h1>
 
 <p align="center">
-  <strong>One man's quest to beat the market with math, code, and an unreasonable amount of caffeine.</strong>
+  <strong>Building automated trading systems for prediction markets — in public, with receipts.</strong>
 </p>
 
 <p align="center">
-  <a href="#mission">Mission</a> •
-  <a href="#projects">Projects</a> •
-  <a href="#mission-log">Mission Log</a> •
-  <a href="#tech-stack">Tech Stack</a>
+  <em>NBA player props on Kalshi · XGBoost + Platt calibration · Kelly sizing · PostgreSQL</em>
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/status-FORWARD_TESTING-yellow?style=flat-square" alt="Status"/>
-  <img src="https://img.shields.io/badge/phase-1_of_3-blue?style=flat-square" alt="Phase"/>
-  <img src="https://img.shields.io/badge/edge-positive_EV_only-green?style=flat-square" alt="Edge"/>
+  <code>STATUS: LIVE</code> · <code>PHASE 1 of 3</code> · <code>POSITIVE EV ONLY</code>
 </p>
 
 ---
 
-## Mission
+## What This Is
 
-I'm building systems that find asymmetric opportunities in prediction markets and sports — not through gut feeling, but through statistical edge, disciplined sizing, and relentless iteration.
+The Edge Lab is the public log of an automated trading system I'm building for prediction markets — currently focused on NBA player rebounds on Kalshi.
 
-This repo is the flight recorder. Every model built, every backtest run, every lesson learned — logged here in real time.
+It's not a tutorial. It's not a course. It's a working system, documented as it evolves: every model rebuild, every bug, every losing trade, every uncomfortable lesson.
 
-**The rules are simple:**
+The repo holds the **story** of the system. The system itself stays private — alpha decays the moment it's published.
+
+**The rules I trade by:**
+
 1. Never bet without an edge.
-2. Let the math decide, not emotion.
-3. Document everything. The process *is* the product.
+2. Let the math decide, not the gut.
+3. Document everything — including the failures. Especially the failures.
 
 ---
 
-## Projects
+## Where The System Stands
 
-### 🎯 EDGE — Automated Betting System
-> *Prediction market trading engine targeting Kalshi*
+| Metric | Value | As of |
+|---|---|---|
+| Total settled predictions | 1,660 | 2026-04-09 |
+| Live capital deployed | $63.76 | 2026-04-09 |
+| Current model | XGBoost + Platt scaling | v5_kelly config |
+| Active prop type (live) | NBA Rebounds | Real money |
+| Active prop types (paper) | Points, Assists | Validation only |
+| Database | PostgreSQL (`warmachine`) | Migrated from SQLite |
+| Schedule | Daily, NBA-aware cron | Windows Task Scheduler |
 
-| Milestone | Status |
-|---|---|
-| NBA probability model (XGBoost) | ✅ Brier 0.1681 (999 predictions) |
-| Fee-adjusted ROI positive @ edge >20% | ✅ +13.0% ROI (forward test) |
-| Forward test automation (daily cron) | ✅ Running (NBA schedule-aware) |
-| Prop-type differential strategy | ✅ Assists +17.2% ROI identified |
-| PostgreSQL migration | ✅ 18.5M rows migrated |
-| 100-prediction v3 config validation | 🔄 In progress |
-| Live transition ($300) | ⏳ Pending v3 validation |
-
-**Stack**: Python · XGBoost · Kalshi API · Kelly Criterion
-**Key insight**: The model doesn't need to be perfect. It needs to be *less wrong* than the market, after fees.
-
-### 🔗 NEXUS — AI Player-Club Matching Engine
-> *L&K Agency internal tool — matches player needs with club needs*
-
-| Milestone | Status |
-|---|---|
-| Architecture design | 🔄 In progress |
-| Data pipeline | ⏳ Planned |
-| Matching algorithm | ⏳ Planned |
-
-### 📊 EDGE Dashboard
-> *Real-time analytics command center*
-
-Kelly Criterion bankroll management, pick analysis, parlay recommendations.
-Built as a standalone HTML dashboard — no server required.
+Numbers update as the system runs. They are not all flattering. That's the point.
 
 ---
 
 ## Mission Log
 
-> *"Space is big. You just won't believe how vastly, hugely, mind-bogglingly big it is."*
-> — Douglas Adams, on markets probably
+The chronological story of the system. Each entry is a snapshot in time — they are not edited after the fact. When something turns out to be wrong, an errata box goes on top of the original and a full record lives in [`ERRATA.md`](./ERRATA.md).
 
-| Date | Entry | Tags |
-|---|---|---|
-| [2026-03-28](logs/2026-03-28.md) | Day 1: System audit complete. Swapped logistic regression → XGBoost. Backtest passed. Forward test automated. The journey begins. | `betting-system` `model` `milestone` |
-| [2026-04-02](logs/2026-04-02-phase1-validation.md) | Phase 1 Validation: 999 predictions settled. Brier 0.1681 ✅. Discovered assists market edge (+17.2% ROI). Killed the Kalshi expiration bug. Migrated to PostgreSQL. Rebuilt calibration. System works — when pointed at the right targets. | `validation` `calibration` `infrastructure` `milestone` |
-| [2026-04-04](logs/2026-04-04-the-price-was-wrong.md) | The Price Was Wrong: Entry price bug fix, NO betting activation, v3 156-bet diagnosis, v4 config rebuild | `bug-fix` `entry-price` `no-betting` `v3-diagnosis` `v4-config` `edge-threshold` |
-
-📁 **[Browse all logs →](logs/)**
+| Date | Ch | Title | Outcome |
+|---|---|---|---|
+| 2026-03-28 | 1 | [System Audit & XGBoost Migration](./logs/2026-03-28-system-audit.md) | SQLite → PostgreSQL, logistic → XGBoost, Brier ↓ |
+| 2026-04-02 | 2 | [Phase 1 Validation](./logs/2026-04-02-phase1-validation.md) | 999 predictions audited, edge by prop type isolated |
+| 2026-04-04 | 3 | [The Price Was Wrong](./logs/2026-04-04-the-price-was-wrong.md) | Entry-price bug exposed, v3 → v4 config rebuild |
+| 2026-04-09 | 4 | [Three Days, Four Bugs, One Repo Sanitized](./logs/2026-04-09-three-days-four-bugs.md) | Live transition, zero-padding bug, public IP audit, gap discovery |
 
 ---
 
 ## Tech Stack
 
-```
-Languages    Python 3.11+ · JavaScript · SQL
-ML/Stats     XGBoost · scikit-learn · Kelly Criterion · Brier Score
-Data         NBA API · Kalshi API · ESPN · Sports Reference
-Infra        GitHub Actions (cron) · Claude Code
-Frontend     React · Chart.js · Tailwind
-Philosophy   Positive EV or GTFO
-```
+Python 3.11+ · XGBoost · Platt scaling · PostgreSQL · Kalshi API · `nba_api` · Kelly criterion (quarter-fraction)
 
----
-
-## How to Read This Repo
-
-**If you're here for the code** → Check [`projects/`](projects/) for each system's source
-**If you're here for the story** → Start with the [Mission Log](#mission-log) and read chronologically
-**If you're here because you also want to beat the market** → Welcome. Read the logs. Learn from my mistakes.
+Code is private. Decisions, results, and lessons are public.
 
 ---
 
 ## About
 
-Built by **Ikjun Jang** — sports agency director by day, quantitative degenerate by night.
-Currently building AI systems at the intersection of sports, finance, and prediction markets.
+Built by **Ikjun Jang** — sports agency director by day, prediction-market quant by night.
 
-- 🏢 Director @ [L&K Agency](https://lnkagency.com) (player transfers, club sponsorships, M&A)
-- 🎓 Duke MMS:FOB '27 (starting July 2026)
-- ⚽ Arsenal fan (yes, this is relevant to the betting models)
+🏢 Director @ L&K Agency (player transfers, club sponsorships, sports M&A)  
+🎓 Duke MMS:FOB '27 (incoming, July 2026)  
+⚽ Arsenal supporter  
 
----
+> *"The edge is in the work nobody sees. The point of writing it down is to make sure I keep doing it."*
 
-<p align="center">
-  <sub>Started: March 28, 2026 · Updated daily(ish) · Built in public</sub>
-</p>
+**Started:** March 28, 2026 · **Updated:** as the system runs · **Built in public**

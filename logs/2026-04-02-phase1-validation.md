@@ -1,3 +1,8 @@
+> **📝 ERRATA — added 2026-04-09**  
+> The ROI numbers in this chapter (+6.1% overall, +17.2% assists) were inflated by an entry-price bug: YES-side fills were logged at the bid instead of the ask. When the same window was re-evaluated under the corrected v3 config, overall ROI was −4.4% and assists −27.8%. Rebounds held up at +17.6% and became the basis for the v4/v5 configs. See [`ERRATA.md`](../ERRATA.md) for the corrected table. The original text below is unedited.
+
+---
+
 # Phase 1 Validation — The First 1,000 Predictions
 
 **Date**: 2026-04-02 (covering 03/28 → 04/02)

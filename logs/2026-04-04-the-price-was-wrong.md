@@ -1,3 +1,8 @@
+> **📝 ERRATA — added 2026-04-09**  
+> `v4_edge_optimized` ran for exactly one day. On April 5 it was replaced by `v5_kelly`, which reactivated assists at a tightened `min_edge=0.25` and introduced quarter-Kelly position sizing with a 5% bankroll cap. v5 is the config that went live with real capital. See [`ERRATA.md`](../ERRATA.md) and Chapter 4 for the full transition. The original text below is unedited.
+
+---
+
 # The Price Was Wrong
 
 **Date**: 2026-04-04 (covering 04/02 → 04/04)

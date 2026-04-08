@@ -1,3 +1,8 @@
+> **📝 ERRATA — added 2026-04-09**  
+> The metrics in this chapter (Brier 0.21 → 0.1852, 999-prediction baseline) were measured on the `legacy` config, before the entry-price bug was discovered in Chapter 3. They reflect the system as it stood on March 28 and are preserved here as a historical snapshot. They are not the system's current performance. See [`ERRATA.md`](../ERRATA.md) for the full record. The original text below is unedited.
+
+---
+
 # Day 1 — System Audit & Model Overhaul
 
 **Date**: 2026-03-28

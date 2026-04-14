@@ -52,17 +52,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-import requests
 from db import get_connection, put_connection
 from kalshi_client import KalshiConfig, create_client
 from signal_engine import SignalEngine, Signal, net_ev, KALSHI_FEE_RATE
 from trade_engine import TradeEngine, TradeOrder
 from active_scanner import ActiveScanner
-from safety import SafetyManager, SAFETY_CONFIG
+from safety import (
+    SafetyManager, SAFETY_CONFIG,
+    CircuitBreakerException, BankruptcyException, DrawdownBreakerException,
+)
+from bankroll import kelly_bet_size
+from kill_switch import KillSwitch
 from learning_log import LearningLog
 from filters import is_within_settlement_window
 from calibration import CalibrationTracker
-from risk_decomposition import tag_loss_category, format_discord_weekly, generate_loss_report
+from risk_decomposition import tag_loss_category
 from self_learner import get_params, SelfLearner
 
 logger = logging.getLogger(__name__)
@@ -82,13 +86,23 @@ def should_place_bet(prop_type: str, side: str, calculated_edge: float) -> bool:
     return calculated_edge >= effective_min
 
 
-def _get_webhook():
-    return os.environ.get("DISCORD_WEBHOOK_URL", "")
-
 def _log_paper_trade(ticker: str, title: str, side: str, price_cents: int,
                      count: int, signal_type: str, edge: float, model_prob: float,
-                     data: dict = None):
+                     data: dict = None, execution_mode: str = "paper"):
     """Record a paper trade for later settlement verification."""
+    # Kelly sizing info
+    entry_price = price_cents / 100.0
+    odds = (1 - entry_price) / entry_price if 0 < entry_price < 1 else 0
+    safety = SafetyManager()
+    k_frac = 0.25
+    k_bet = kelly_bet_size(edge, odds, safety.bankroll, k_frac) if odds > 0 else 0
+    if odds > 0:
+        p = edge + (1 / (1 + odds))
+        q = 1 - p
+        k_full_pct = max(0, (odds * p - q) / odds)
+    else:
+        k_full_pct = 0
+
     entry = {
         "ticker": ticker,
         "title": title,
@@ -104,6 +118,11 @@ def _log_paper_trade(ticker: str, title: str, side: str, price_cents: int,
         "entered_at": datetime.now(timezone.utc).isoformat(),
         "status": "open",
         "source": "auto",
+        "kelly_fraction": k_frac,
+        "kelly_bet_size": round(k_bet, 2),
+        "kelly_full_pct": round(k_full_pct, 4),
+        "bet_contracts": count,
+        "execution_mode": execution_mode,
     }
     PAPER_TRADES_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(PAPER_TRADES_FILE, "a", encoding="utf-8") as f:
@@ -112,8 +131,17 @@ def _log_paper_trade(ticker: str, title: str, side: str, price_cents: int,
 # ============================================================================
 # SAFETY KILL SWITCH
 # ============================================================================
-# DANGER: Set to False only after forward test validation and Ikjun approval
-FORCE_DRY_RUN = True
+# Set True to force ALL trades to paper mode (emergency override).
+FORCE_DRY_RUN = False
+
+# ============================================================================
+# LIVE PROP TYPE ROUTING
+# ============================================================================
+# Only these prop types execute via Kalshi API (real money).
+# All other prop types remain paper-traded.
+# FORCE_DRY_RUN=True overrides this (everything stays paper).
+LIVE_PROP_TYPES = {"rebounds"}
+MAX_OPEN_POSITIONS = 10
 
 # ============================================================================
 # Auto-Trading Thresholds
@@ -128,58 +156,6 @@ ORDER_TIMEOUT_SEC = 60         # cancel unfilled orders after 60s
 MAX_BET_REGULAR = SAFETY_CONFIG["max_single_bet"]      # $35
 MAX_BET_ARB = SAFETY_CONFIG["max_single_bet_arb"]      # $50
 MAX_SETTLEMENT_HOURS = SAFETY_CONFIG["max_settlement_hours"]  # 72h
-
-
-# ============================================================================
-# Discord Alerts (Korean emoji format)
-# ============================================================================
-
-def _discord(content: str):
-    if not _get_webhook():
-        logger.info(f"[Discord] {content}")
-        return
-    try:
-        requests.post(_get_webhook(), json={"content": content}, timeout=10)
-    except Exception:
-        pass
-
-
-def alert_order_submitted(ticker: str, side: str, price_cents: int, count: int,
-                          edge: float, title: str = ""):
-    t = (title or ticker)[:40]
-    _discord(
-        f"\U0001f535 **Order**: {t} | {side.upper()} {price_cents}c x{count} | "
-        f"edge {edge*100:.1f}%"
-    )
-
-
-def alert_order_filled(ticker: str, side: str, price_cents: int, count: int,
-                       title: str = ""):
-    t = (title or ticker)[:40]
-    _discord(f"\U0001f7e2 **Filled**: {t} | {side.upper()} {price_cents}c x{count}")
-
-
-def alert_order_cancelled(ticker: str, title: str = ""):
-    t = (title or ticker)[:40]
-    _discord(f"\u26aa **Unfilled cancel**: {t}")
-
-
-def alert_settlement_win(ticker: str, amount: float, title: str = ""):
-    t = (title or ticker)[:40]
-    _discord(f"\U0001f4b0 **Win**: {t} +${amount:.2f}")
-
-
-def alert_settlement_loss(ticker: str, amount: float, title: str = ""):
-    t = (title or ticker)[:40]
-    _discord(f"\U0001f534 **Loss**: {t} -${abs(amount):.2f}")
-
-
-def alert_daily_limit():
-    _discord("\U0001f6d1 **Daily limit reached. Halted until tomorrow.**")
-
-
-def alert_error(msg: str):
-    _discord(f"\u26a0\ufe0f **Error**: {msg[:200]}")
 
 
 # ============================================================================
@@ -203,6 +179,7 @@ class AutoTrader:
         self.safety = SafetyManager()
         self.learn = LearningLog()
         self.calibration = CalibrationTracker()
+        self.kill_switch = KillSwitch()
 
         # Track pending orders for timeout cancellation
         self._pending_orders: List[dict] = []
@@ -211,6 +188,32 @@ class AutoTrader:
 
         # Fix 5: Load existing position tickers to prevent duplicate orders on restart
         self._load_existing_positions()
+
+    # ----------------------------------------------------------------
+    # Helpers: emergency kill switch engagement
+    # ----------------------------------------------------------------
+
+    def _engage_kill_switch(self, reason: str) -> None:
+        """Write data/kill_switch.json so subsequent runs also block trades.
+
+        Used when a CircuitBreakerException is raised during run_cycle:
+        the exception is serialized as the kill_switch reason, so even if
+        the process restarts it cannot resume trading until the file is
+        removed manually.
+        """
+        from pathlib import Path as _Path
+        import json as _json
+        repo_root = _Path(__file__).resolve().parent.parent
+        target = repo_root / "data" / "kill_switch.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "enabled": True,
+            "reason": reason,
+            "set_by": "circuit_breaker",
+            "set_at": datetime.now(timezone.utc).isoformat(),
+        }
+        target.write_text(_json.dumps(payload, indent=2))
+        logger.critical(f"[AutoTrader] kill_switch.json engaged: {reason}")
 
     # ----------------------------------------------------------------
     # Core: Scan + Execute cycle
@@ -231,29 +234,54 @@ class AutoTrader:
             "arb_executed": 0,
         }
 
+        # Kill switch early check (cycle-level gate). Skip before any expensive
+        # scans so an engaged switch stops the cycle at the top.
+        ks_status = self.kill_switch.check()
+        if ks_status.active:
+            logger.warning(
+                f"[AutoTrader] Kill switch engaged ({ks_status.reason!r}) - "
+                f"skipping entire cycle"
+            )
+            return results
+
         # Check if we can trade at all
         can_result = self.safety.can_bet()
         can_bet = can_result[0] if isinstance(can_result, tuple) else can_result
         if not can_bet:
             reason = can_result[1] if isinstance(can_result, tuple) else ""
             logger.info(f"[AutoTrader] Cannot trade: {reason}")
-            if "daily" in str(reason).lower() or "weekly" in str(reason).lower():
-                alert_daily_limit()
             return results
 
+        # Wrap the full cycle body so a CircuitBreakerException raised deep
+        # inside record_result() triggers auto-engagement of kill_switch.
+        try:
+            return self._run_cycle_body(results)
+        except BankruptcyException as e:
+            logger.critical(f"[CIRCUIT BREAKER / BANKRUPTCY] {e}")
+            self._engage_kill_switch(reason=f"bankruptcy: {e}")
+            raise
+        except DrawdownBreakerException as e:
+            logger.critical(f"[CIRCUIT BREAKER / DRAWDOWN RED] {e}")
+            self._engage_kill_switch(reason=f"drawdown_red: {e}")
+            raise
+        except CircuitBreakerException as e:
+            logger.critical(f"[CIRCUIT BREAKER] {e}")
+            self._engage_kill_switch(reason=f"circuit_breaker: {e}")
+            raise
+
+    def _run_cycle_body(self, results: dict) -> dict:
+        """Inner cycle steps. CircuitBreakerException propagates up to run_cycle."""
         # 1. Signal Engine scan (72h filter applied internally)
         try:
             self._process_signals(results)
         except Exception as e:
             logger.error(f"[AutoTrader] Signal scan error: {e}")
-            alert_error(f"Signal scan: {e}")
 
         # 2. Arbitrage scan
         try:
             self._process_arbitrage(results)
         except Exception as e:
             logger.error(f"[AutoTrader] Arb scan error: {e}")
-            alert_error(f"Arb scan: {e}")
 
         # 3. Cancel timed-out orders
         try:
@@ -295,6 +323,9 @@ class AutoTrader:
 
         results["signals_found"] = len(signals)
 
+        # Max open positions check
+        open_positions = len(self.trade_engine.positions.get_positions())
+
         # Sort by ev_per_hour descending: capital-efficient trades first
         signals.sort(
             key=lambda s: s.data.get("ev_per_hour", 0),
@@ -302,6 +333,10 @@ class AutoTrader:
         )
 
         for sig in signals:
+            if open_positions >= MAX_OPEN_POSITIONS:
+                logger.info(f"[AutoTrader] Max open positions ({MAX_OPEN_POSITIONS}) reached, skipping remaining signals")
+                break
+
             if sig.ticker in self._traded_tickers:
                 continue
 
@@ -414,6 +449,7 @@ class AutoTrader:
 
             # Execute
             self._execute_signal(sig, price_cents, count, results)
+            open_positions += 1
 
     def _process_arbitrage(self, results: dict):
         """Scan for arbitrage and auto-execute."""
@@ -471,7 +507,7 @@ class AutoTrader:
                 edge=edge,
             )
 
-            self._submit_order(order, opp.get("title", ticker), results)
+            self._submit_order(order, opp.get("title", ticker), results, prop_type="arb")
             results["arb_executed"] = results.get("arb_executed", 0) + 1
 
     # ----------------------------------------------------------------
@@ -490,10 +526,12 @@ class AutoTrader:
             model_prob=sig.model_prob,
             edge=sig.edge,
         )
-        self._submit_order(order, sig.title, results, sig_data=sig.data)
+        prop_type = sig.data.get("prop_type", "")
+        self._submit_order(order, sig.title, results, sig_data=sig.data, prop_type=prop_type)
 
-    def _submit_order(self, order: TradeOrder, title: str, results: dict, sig_data: dict = None):
-        """Submit order and track for timeout."""
+    def _submit_order(self, order: TradeOrder, title: str, results: dict,
+                      sig_data: dict = None, prop_type: str = ""):
+        """Submit order and track for timeout. Routes live vs paper per prop_type."""
         # Validate through safety
         valid, reason = self.trade_engine.validate_trade(order)
         if not valid:
@@ -504,32 +542,40 @@ class AutoTrader:
             )
             return
 
-        if self.dry_run:
+        # Per-signal live/paper routing
+        signal_is_live = (
+            not self.dry_run
+            and not FORCE_DRY_RUN
+            and prop_type in LIVE_PROP_TYPES
+        )
+        execution_mode = "live" if signal_is_live else "paper"
+
+        if not signal_is_live:
             result = self.trade_engine.execute_order(order, dry_run=True)
             logger.info(
                 f"[AutoTrader] PAPER: {order.side.upper()} {order.ticker} "
-                f"@ {order.price_cents}c x{order.count} edge={order.edge*100:.1f}%"
+                f"@ {order.price_cents}c x{order.count} edge={order.edge*100:.1f}% "
+                f"[prop={prop_type}]"
             )
-            # Record paper trade for settlement tracking
             _log_paper_trade(
                 order.ticker, title, order.side, order.price_cents,
                 order.count, order.signal_type, order.edge, order.model_prob,
-                data=sig_data,
+                data=sig_data, execution_mode=execution_mode,
             )
             results["orders_submitted"] = results.get("orders_submitted", 0) + 1
             results["orders_filled"] = results.get("orders_filled", 0) + 1
         else:
+            logger.info(
+                f"[AutoTrader] *** LIVE ***: {order.side.upper()} {order.ticker} "
+                f"@ {order.price_cents}c x{order.count} edge={order.edge*100:.1f}% "
+                f"[prop={prop_type}]"
+            )
             result = self.trade_engine.execute_order(order, dry_run=False)
 
             if result.get("status") == "submitted":
                 order_id = result.get("order_id", "")
-                alert_order_submitted(
-                    order.ticker, order.side, order.price_cents,
-                    order.count, order.edge, title,
-                )
                 results["orders_submitted"] = results.get("orders_submitted", 0) + 1
 
-                # Track for timeout cancellation
                 self._pending_orders.append({
                     "order_id": order_id,
                     "ticker": order.ticker,
@@ -549,7 +595,7 @@ class AutoTrader:
             elif result.get("status") == "rejected":
                 logger.warning(f"[AutoTrader] Rejected: {result.get('reason')}")
             elif result.get("status") == "error":
-                alert_error(f"Order error for {order.ticker}: {result.get('error')}")
+                logger.error(f"[AutoTrader] Order error for {order.ticker}: {result.get('error')}")
 
         self._traded_tickers.add(order.ticker)
 
@@ -583,7 +629,6 @@ class AutoTrader:
                     if resting:
                         # Still resting -> cancel
                         self.client.cancel_order(order_id)
-                        alert_order_cancelled(pending["ticker"], pending["title"])
                         results["orders_cancelled"] = results.get("orders_cancelled", 0) + 1
                         logger.info(f"[AutoTrader] Cancelled stale order: {pending['ticker']}")
 
@@ -593,11 +638,6 @@ class AutoTrader:
                         )
                     else:
                         # Not resting = filled or already cancelled
-                        alert_order_filled(
-                            pending["ticker"], pending["side"],
-                            pending["price_cents"], pending["count"],
-                            pending["title"],
-                        )
                         results["orders_filled"] = results.get("orders_filled", 0) + 1
 
                 except Exception as e:
@@ -628,14 +668,12 @@ class AutoTrader:
                         gross = (1 - entry) * count
                         fee = gross * KALSHI_FEE_RATE
                         pnl = gross - fee
-                        alert_settlement_win(ticker, pnl, pos.get("title", ""))
                         self.learn.trade_exited(
                             ticker, side, entry, 1.0, count, pnl, "settled:win"
                         )
                     else:
                         # Loss
                         pnl = -entry * count
-                        alert_settlement_loss(ticker, pnl, pos.get("title", ""))
                         self.learn.trade_exited(
                             ticker, side, entry, 0.0, count, pnl, "settled:loss"
                         )
@@ -805,13 +843,6 @@ class AutoTrader:
                         except Exception as e:
                             logger.error(f"[Exit] Error submitting exit for {ticker}: {e}")
 
-                    # Discord alert
-                    emoji = "\U0001f4b0" if net_pnl > 0 else "\U0001f534"
-                    _discord(
-                        f"{emoji} **Exit**: {(entry.get('title', ticker))[:40]} | "
-                        f"{exit_reason} | P&L=${net_pnl:+.2f}"
-                    )
-
                     self.learn._write({
                         "type": "exit_triggered",
                         "ticker": ticker,
@@ -873,10 +904,7 @@ class AutoTrader:
                         confidence: str = "medium",
                         data_points: int = 10) -> int:
         """
-        Fractional Kelly position sizing.
-
-        Full Kelly is theoretically optimal but assumes perfect edge estimation.
-        When edge estimates are noisy, full Kelly leads to ruin.
+        Kelly Criterion position sizing via bankroll.kelly_bet_size().
 
         Fractions:
           high confidence   -> 0.50 Kelly (half)
@@ -902,11 +930,17 @@ class AutoTrader:
         if data_points < 5:
             kelly_frac *= 0.5
 
-        # Full Kelly count from trade engine
-        full_kelly_count = self.trade_engine.size_order(model_prob, price, side)
+        # Calculate edge and odds for kelly_bet_size
+        edge = abs(model_prob - price)
+        odds = (1 - entry) / entry if entry > 0 else 0
+        if odds <= 0:
+            return 0
 
-        # Apply fractional Kelly
-        count = int(full_kelly_count * kelly_frac)
+        bankroll = self.safety.bankroll
+        bet_dollars = kelly_bet_size(edge, odds, bankroll, kelly_frac)
+
+        # Convert dollars to contracts
+        count = int(bet_dollars / entry) if entry > 0 else 0
 
         # Cap by max bet
         max_count = int(max_bet / entry)
@@ -1012,86 +1046,8 @@ class AutoTrader:
                     f"bias={bias['direction']} ({bias['magnitude']*100:.1f}pp) | "
                     f"n={n}"
                 )
-                if brier >= 0.25 and n >= 10:
-                    _discord(
-                        f"\u26a0\ufe0f **Model accuracy deteriorating** \u2014 "
-                        f"Brier={brier:.3f} (>0.25 = worse than coin flip). "
-                        f"Bias: {bias['direction']}. n={n}"
-                    )
             except Exception as e:
                 logger.error(f"[Calibration] Error: {e}")
-
-        # === 25-trade milestone report (fires once) ===
-        self._check_milestone_report()
-
-    def _check_milestone_report(self):
-        """Send a one-time Discord report when 25 settled paper trades are reached."""
-        marker = PROJECT_ROOT / "data" / ".milestone_25_sent"
-        if marker.exists():
-            return
-
-        # Count settled auto trades
-        if not PAPER_TRADES_FILE.exists():
-            return
-        settled = []
-        with open(PAPER_TRADES_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                d = json.loads(line)
-                if d.get("source") == "auto" and d.get("status") in ("win", "loss"):
-                    settled.append(d)
-
-        if len(settled) < 25:
-            return
-
-        # Reached 25! Build report
-        logger.info(f"[Milestone] 25 settled paper trades reached! Sending report.")
-
-        wins = sum(1 for s in settled if s["status"] == "win")
-        losses = len(settled) - wins
-        win_rate = wins / len(settled) * 100
-
-        paper_pnl = sum(s.get("paper_pnl", 0) for s in settled)
-
-        brier = self.calibration.get_brier_score()
-        bias = self.calibration.get_bias()
-
-        loss_report = generate_loss_report()
-        loss_cats = loss_report.get("categories", {})
-
-        from self_learner import SelfLearner
-        learner = SelfLearner()
-        can_tune = learner.should_tune()
-
-        # Format
-        lines = [
-            f"**Settled**: {len(settled)} trades",
-            f"**Win Rate**: {wins}W / {losses}L ({win_rate:.1f}%)",
-            f"**Paper P&L**: ${paper_pnl:+.2f}",
-            "",
-            f"**Brier Score**: {brier:.4f} {'(good)' if brier < 0.20 else '(needs work)' if brier < 0.25 else '(poor)'}",
-            f"**Bias**: {bias['direction']} ({bias['magnitude']*100:.1f}pp)",
-            "",
-            "**Loss Breakdown**:",
-        ]
-        for cat, data in sorted(loss_cats.items(), key=lambda x: x[1].get("amount", 0), reverse=True):
-            lines.append(f"  {cat.replace('_',' ').title()}: {data['count']} trades ({data['pct_amount']:.0f}%)")
-
-        lines.append("")
-        n_preds = self.calibration.state.get("total_predictions", 0)
-        sl_status = "Ready to tune" if can_tune else f"Waiting ({n_preds}/50 predictions)"
-        lines.append(f"**Self-Learner**: {sl_status}")
-
-        _discord(
-            f"\U0001f4ca **25-Trade Milestone Report**\n"
-            + "\n".join(lines)
-        )
-
-        # Mark as sent
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text(datetime.now(timezone.utc).isoformat())
 
     def _load_existing_positions(self):
         """Fix 5: Load existing position tickers on startup to prevent duplicates."""
@@ -1115,13 +1071,11 @@ class AutoTrader:
         current_tickers = self.trade_engine.positions.get_tickers()
         self._traded_tickers.update(current_tickers)
 
-        # Fix 4: Discord warning on mismatch
         if changes.get("mismatches"):
             for m in changes["mismatches"]:
-                _discord(
-                    f"\u26a0\ufe0f **Position mismatch**: {m['ticker'][:40]} "
-                    f"local={m['local_count']} vs Kalshi={m['kalshi_count']} "
-                    f"(synced to Kalshi)"
+                logger.warning(
+                    f"[Sync] Position mismatch: {m['ticker'][:40]} "
+                    f"local={m['local_count']} vs Kalshi={m['kalshi_count']} (synced)"
                 )
 
         if changes.get("removed"):
@@ -1131,7 +1085,6 @@ class AutoTrader:
         if changes.get("added"):
             for t in changes["added"]:
                 logger.info(f"[Sync] Added position from Kalshi: {t[:50]}")
-                _discord(f"\u26a0\ufe0f **Position found on Kalshi not in local**: {t[:40]}")
 
     def reset_cycle(self):
         """Reset per-cycle state. Keep _traded_tickers across cycles to prevent duplicates."""
@@ -1177,13 +1130,6 @@ def main():
     print("  ====================================================")
     print()
 
-    if not args.dry_run:
-        _discord(
-            "\U0001f680 **War Machine AUTO TRADER started** | "
-            f"edge>={MIN_EDGE_AUTO*100:.0f}% | spread<={MAX_SPREAD_CENTS_AUTO}c | "
-            f"timeout={ORDER_TIMEOUT_SEC}s | max=${MAX_BET_REGULAR}"
-        )
-
     trader = AutoTrader(dry_run=args.dry_run)
     cycle = 0
 
@@ -1214,9 +1160,6 @@ def main():
 
     except KeyboardInterrupt:
         logger.info("Stopped by user")
-    finally:
-        if not args.dry_run:
-            _discord("\u23f9\ufe0f **War Machine AUTO TRADER stopped**")
 
 
 if __name__ == "__main__":

@@ -37,7 +37,7 @@ SAFETY_CONFIG = {
     "starting_bankroll": 300,       # paper trading virtual bankroll
     "max_single_bet": 35,
     "max_single_bet_arb": 50,       # arbitrage (confirmed profit) has higher limit
-    "daily_max_loss": 75,
+    "daily_max_loss": 20,
     "weekly_max_loss": 150,
     "min_edge_pregame": 0.10,
     "min_edge_live": 0.08,
@@ -49,6 +49,32 @@ SAFETY_CONFIG = {
     "cooldown_after_loss_streak_hours": 4,
     "max_settlement_hours": 72,     # only trade markets settling within 72h
 }
+
+
+# ============================================================================
+# Circuit Breaker Exceptions
+# ============================================================================
+# Hard halts that callers MUST catch. Soft limits (daily/weekly halt flags,
+# loss-streak cooldown) stay as mutable state — only these 4 conditions raise.
+
+class CircuitBreakerException(Exception):
+    """Base class for hard halts. Callers must catch and stop trading."""
+
+
+class EquityBreakerException(CircuitBreakerException):
+    """Daily or weekly loss limit exceeded (reserved for future hard escalation)."""
+
+
+class DrawdownBreakerException(CircuitBreakerException):
+    """Drawdown from HWM exceeded the RED threshold (15%)."""
+
+
+class BankruptcyException(CircuitBreakerException):
+    """Bankroll fell below the survival floor ($100). Triggers 2-week paper cooldown."""
+
+
+class LossStreakBreakerException(CircuitBreakerException):
+    """Consecutive loss streak exceeded (reserved)."""
 
 
 # ============================================================================
@@ -74,6 +100,17 @@ class SafetyManager:
         self.today = datetime.now(timezone.utc).date()
         self.week_start = self._get_week_start()
 
+        # Hard Circuit Breaker 필드 (Sprint 1 Day 1 추가)
+        # 참고: _load_state()가 호출되기 전 기본값으로 초기화, 이후 disk 값으로 덮어씀
+        self.high_water_mark: float = self.bankroll
+        self.max_drawdown_pct: float = 0.15   # RED threshold
+        self.dd_level_yellow: float = 0.07    # YELLOW threshold
+        self.dd_level_orange: float = 0.12    # ORANGE threshold
+        self.bankruptcy_floor: float = 100.0
+        self.bankruptcy_cooldown_days: int = 14
+        self.bankruptcy_triggered_at: Optional[str] = None   # ISO8601 string
+        self.paper_only_until: Optional[str] = None          # ISO8601 string
+
         # 기록
         self.bets_today = []
 
@@ -94,6 +131,16 @@ class SafetyManager:
                 self.consecutive_losses = data.get("consecutive_losses", 0)
                 self.daily_halted = data.get("daily_halted", False)
                 self.weekly_halted = data.get("weekly_halted", False)
+
+                # Hard Circuit Breaker 필드 (Sprint 1 Day 1)
+                # Fallback 순서:
+                #   high_water_mark 디스크 값 → bankroll → starting_bankroll
+                self.high_water_mark = data.get(
+                    "high_water_mark",
+                    data.get("bankroll", self.config["starting_bankroll"]),
+                )
+                self.bankruptcy_triggered_at = data.get("bankruptcy_triggered_at")
+                self.paper_only_until = data.get("paper_only_until")
 
                 saved_date = data.get("date", "")
                 if saved_date != str(self.today):
@@ -129,13 +176,43 @@ class SafetyManager:
             "week_start": str(self.week_start),
             "cooldown_until": self.cooldown_until.isoformat() if self.cooldown_until else None,
             "active_bets": self.active_bets,
+            # Hard Circuit Breaker 필드 (Sprint 1 Day 1)
+            "high_water_mark": self.high_water_mark,
+            "bankruptcy_triggered_at": self.bankruptcy_triggered_at,
+            "paper_only_until": self.paper_only_until,
         }
         json.dump(data, open(self.state_file, "w"), indent=2)
 
     # ── 검증 ────────────────────────────────────────────────────
 
-    def can_bet(self) -> tuple:
-        """배팅 가능 여부 + 사유"""
+    def can_bet(self) -> tuple[bool, str]:
+        """배팅 가능 여부 + 사유.
+
+        NOTE: exit_position()은 이 함수를 호출하지 않음 (trade_engine.py:556 확인).
+        ORANGE/RED 상태 또는 Bankruptcy cooldown 중에도 기존 포지션 청산은 정상 작동.
+        """
+        # 0. Bankruptcy cooldown (2-week paper-only window after floor breach)
+        if self.paper_only_until:
+            try:
+                until = datetime.fromisoformat(
+                    self.paper_only_until.replace("Z", "+00:00")
+                )
+                if datetime.now(timezone.utc) < until:
+                    remaining_days = (until - datetime.now(timezone.utc)).days
+                    return False, f"Bankruptcy cooldown — Paper only {remaining_days}일 남음"
+            except (ValueError, TypeError):
+                pass
+
+        # 1. Drawdown RED — 신규 진입 차단
+        lvl = self.dd_level()
+        if lvl == "RED":
+            return False, f"Drawdown RED ({self._current_drawdown()*100:.1f}%) — 신규 거래 차단"
+
+        # 2. Drawdown ORANGE — 신규 진입 차단 (exit_position은 우회)
+        if lvl == "ORANGE":
+            return False, f"Drawdown ORANGE ({self._current_drawdown()*100:.1f}%) — 신규 진입 금지"
+
+        # 3. 기존 soft halts ──
         # 일일 중단
         if self.daily_halted:
             return False, "일일 손실 한도 도달 — 오늘 배팅 중단"
@@ -180,14 +257,54 @@ class SafetyManager:
         return True, "검증 통과"
 
     def calculate_bet_size(self, model_prob: float, market_prob: float) -> float:
-        """안전한 배팅 금액 계산"""
+        """안전한 배팅 금액 계산.
+
+        YELLOW (DD 7-12%) 상태에서는 Kelly 결과를 50% 축소한 후 cap을 적용한다.
+        ORANGE/RED는 can_bet() 단계에서 이미 차단되므로 여기에 도달하지 않음.
+        """
         from bankroll import KellyCriterion
         decimal_odds = 1.0 / market_prob if market_prob > 0 else 0
         kelly = KellyCriterion.calculate_kelly(
             model_prob, decimal_odds, self.config["kelly_fraction"]
         )
         raw = self.bankroll * kelly
+
+        # YELLOW level: halve new positions
+        if self.dd_level() == "YELLOW":
+            raw *= 0.5
+
         return min(raw, self.config["max_single_bet"], self.bankroll * 0.05)
+
+    # ── Drawdown 4-Level System (Sprint 1 Day 1) ─────────────────
+
+    def _current_drawdown(self) -> float:
+        """Return current drawdown as positive fraction. 0.0 = at peak."""
+        if self.high_water_mark <= 0:
+            return 0.0
+        dd = (self.high_water_mark - self.bankroll) / self.high_water_mark
+        return max(0.0, dd)
+
+    def dd_level(self) -> str:
+        """Current drawdown level: GREEN | YELLOW | ORANGE | RED.
+
+        GREEN  : 0-7%   normal operation
+        YELLOW : 7-12%  halve new position sizing
+        ORANGE : 12-15% block new entries (exits still allowed)
+        RED    : >=15%  hard stop via DrawdownBreakerException
+        """
+        dd = self._current_drawdown()
+        if dd >= self.max_drawdown_pct:
+            return "RED"
+        if dd >= self.dd_level_orange:
+            return "ORANGE"
+        if dd >= self.dd_level_yellow:
+            return "YELLOW"
+        return "GREEN"
+
+    def _update_hwm(self):
+        """Ratchet up high-water-mark if bankroll reached a new peak."""
+        if self.bankroll > self.high_water_mark:
+            self.high_water_mark = self.bankroll
 
     # ── 결과 기록 ───────────────────────────────────────────────
 
@@ -213,8 +330,37 @@ class SafetyManager:
         else:
             self.consecutive_losses += 1
 
+        # HWM ratchet (반드시 하드 체크 전 호출)
+        self._update_hwm()
+
         alert_reason = None
 
+        # ── Hard Circuit Breakers (순서: 가장 심각한 것 먼저) ──
+        # Bankruptcy — 잔고가 생존선($100) 이하로 하락
+        if self.bankroll <= self.bankruptcy_floor:
+            if not self.bankruptcy_triggered_at:
+                now_iso = datetime.now(timezone.utc).isoformat()
+                self.bankruptcy_triggered_at = now_iso
+                self.paper_only_until = (
+                    datetime.now(timezone.utc)
+                    + timedelta(days=self.bankruptcy_cooldown_days)
+                ).isoformat()
+            self.save_state()
+            raise BankruptcyException(
+                f"Bankroll ${self.bankroll:.2f} <= floor ${self.bankruptcy_floor:.2f}. "
+                f"Paper-only until {self.paper_only_until}."
+            )
+
+        # Drawdown RED (>= 15% from HWM)
+        dd = self._current_drawdown()
+        if dd >= self.max_drawdown_pct:
+            self.save_state()
+            raise DrawdownBreakerException(
+                f"Drawdown {dd*100:.1f}% >= limit {self.max_drawdown_pct*100:.0f}% "
+                f"(HWM ${self.high_water_mark:.2f} -> current ${self.bankroll:.2f})"
+            )
+
+        # ── Soft halts (기존 동작 보존) ──
         # 일일 손실 한도
         if self.daily_pnl <= -self.config["daily_max_loss"]:
             self.daily_halted = True

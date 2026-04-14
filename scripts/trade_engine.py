@@ -57,6 +57,7 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 from kalshi_client import KalshiConfig, KalshiAPIClient, create_client
 from safety import SafetyManager, SAFETY_CONFIG
 from signal_engine import net_ev, breakeven_prob, KALSHI_FEE_RATE
+from kill_switch import KillSwitch, KillSwitchActive
 
 logger = logging.getLogger(__name__)
 
@@ -377,6 +378,7 @@ class TradeEngine:
         self.safety = SafetyManager()
         self.positions = PositionManager()
         self.trade_log = TradeLogger()
+        self.kill_switch = KillSwitch()
 
     def size_order(self, model_prob: float, market_price: float,
                    side: str = "yes") -> int:
@@ -475,6 +477,14 @@ class TradeEngine:
         if not valid:
             return {"status": "rejected", "reason": reason}
 
+        # Emergency kill switch (file-based, fail-safe)
+        try:
+            self.kill_switch.must_be_clear(
+                action_label=f"execute_order({order.ticker} {order.side})"
+            )
+        except KillSwitchActive as e:
+            return {"status": "blocked", "reason": str(e)}
+
         price_dollars = order.price_cents / 100
         total_cost = price_dollars * order.count
 
@@ -559,6 +569,14 @@ class TradeEngine:
         pos = self.positions.get_position(ticker, side)
         if not pos:
             return {"status": "error", "reason": f"No open {side} position for {ticker}"}
+
+        # Emergency kill switch (covers exit path; execute_order bypassed by design)
+        try:
+            self.kill_switch.must_be_clear(
+                action_label=f"exit_position({ticker} {side})"
+            )
+        except KillSwitchActive as e:
+            return {"status": "blocked", "reason": str(e)}
 
         exit_count = min(count, pos["count"])
         entry_price = pos["avg_entry_price"]

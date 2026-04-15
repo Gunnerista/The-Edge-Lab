@@ -42,3 +42,7 @@ experiments/
 *.bak_*
 CLAUDE_md_backup_*.md
 data/_emergency_reconcile_*.log
+
+# Cleanup archive 2026-04-15
+_cleanup_archive_*/
+

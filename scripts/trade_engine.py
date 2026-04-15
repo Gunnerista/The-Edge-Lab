@@ -211,19 +211,32 @@ class PositionManager:
             api_map = {}  # key -> {ticker, side, position_count}
 
             for p in api_positions.get("market_positions", []):
-                pos_count = p.get("position", 0)
+                pos_count_str = p.get("position_fp", p.get("position", "0"))
+                try:
+                    pos_count_f = float(pos_count_str)
+                except (TypeError, ValueError):
+                    pos_count_f = 0.0
+                pos_count = int(round(abs(pos_count_f)))
+                # avg entry ≈ total_traded_dollars / count (actual cost at fill)
+                try:
+                    total_traded = float(p.get("total_traded_dollars", "0") or 0)
+                except (TypeError, ValueError):
+                    total_traded = 0.0
+                avg_entry_price = (total_traded / pos_count) if pos_count > 0 else 0.0
+                pos_side = "yes" if pos_count_f > 0 else ("no" if pos_count_f < 0 else None)
                 if pos_count == 0:
                     continue
 
                 ticker = p.get("ticker", "")
-                side = "yes" if pos_count > 0 else "no"
-                count = abs(pos_count)
+                side = pos_side if pos_side is not None else ("yes" if pos_count_f > 0 else "no")
+                count = pos_count  # already abs after patch 1
                 key = f"{ticker}_{side}"
                 api_map[key] = {
                     "ticker": ticker,
                     "side": side,
                     "count": count,
-                    "market_exposure": p.get("market_exposure", 0),
+                    "avg_entry_price": avg_entry_price,
+                    "market_exposure": float(p.get("market_exposure_dollars", p.get("market_exposure", "0")) or 0),
                 }
 
             # Remove positions that no longer exist on Kalshi
@@ -252,7 +265,7 @@ class PositionManager:
                         "ticker": api_pos["ticker"],
                         "title": "",
                         "side": api_pos["side"],
-                        "avg_entry_price": 0,  # unknown from API
+                        "avg_entry_price": api_pos.get("avg_entry_price", 0),
                         "count": api_pos["count"],
                         "opened_at": datetime.now(timezone.utc).isoformat(),
                         "signal_type": "synced_from_kalshi",

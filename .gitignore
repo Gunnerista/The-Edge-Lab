@@ -30,3 +30,15 @@ Thumbs.db
 
 # Jupyter
 .ipynb_checkpoints/
+
+# === Security additions 2026-04-15 ===
+keys/
+*.pem
+private_key*
+backups/
+backup_before_cleanup_*/
+experiments/
+*.bak.*
+*.bak_*
+CLAUDE_md_backup_*.md
+data/_emergency_reconcile_*.log

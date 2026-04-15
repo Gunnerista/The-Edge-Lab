@@ -36,7 +36,6 @@ Usage:
 import sys
 import json
 import math
-import sqlite3
 import logging
 import argparse
 from datetime import datetime, timezone, timedelta
@@ -47,10 +46,11 @@ from collections import defaultdict
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from db import get_connection, put_connection
+
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DB_PATH = PROJECT_ROOT / "data" / "market_data.db"
 
 
 # ============================================================================
@@ -103,13 +103,13 @@ class Anomaly:
 class PriceAnalyzer:
     """Analyzes price data from market_data.db."""
 
-    def __init__(self, db_path: Path = DB_PATH):
-        self.conn = sqlite3.connect(str(db_path))
-        self.conn.row_factory = sqlite3.Row
+    def __init__(self):
+        self.conn = get_connection(dict_cursor=True)
 
     def _query(self, sql: str, params: tuple = ()) -> List[dict]:
-        rows = self.conn.execute(sql, params).fetchall()
-        return [dict(r) for r in rows]
+        cur = self.conn.cursor()
+        cur.execute(sql, params)
+        return [dict(r) for r in cur.fetchall()]
 
     # ----------------------------------------------------------------
     # 1. Spread Analysis
@@ -123,7 +123,7 @@ class PriceAnalyzer:
         where = "WHERE s.yes_bid > 0 AND s.yes_ask > 0 AND s.yes_ask > s.yes_bid"
         params = []
         if category:
-            where += " AND m.category = ?"
+            where += " AND m.category = %s"
             params.append(category)
 
         rows = self._query(f"""
@@ -138,7 +138,7 @@ class PriceAnalyzer:
             LEFT JOIN markets m ON s.ticker = m.ticker
             {where}
             GROUP BY s.ticker
-            HAVING cnt >= 1
+            HAVING COUNT(*) >= 1
             ORDER BY avg_spread ASC
         """, tuple(params))
 
@@ -186,7 +186,7 @@ class PriceAnalyzer:
         where = "WHERE s.yes_price > 0"
         params = []
         if category:
-            where += " AND m.category = ?"
+            where += " AND m.category = %s"
             params.append(category)
 
         rows = self._query(f"""
@@ -199,7 +199,7 @@ class PriceAnalyzer:
             LEFT JOIN markets m ON s.ticker = m.ticker
             {where}
             GROUP BY s.ticker
-            HAVING cnt >= ?
+            HAVING COUNT(*) >= %s
             ORDER BY (MAX(s.yes_price) - MIN(s.yes_price)) DESC
         """, tuple(params) + (min_observations,))
 
@@ -210,7 +210,7 @@ class PriceAnalyzer:
 
             # Compute std dev with a separate query for this ticker
             std_rows = self._query(
-                "SELECT yes_price FROM price_snapshots WHERE ticker = ? AND yes_price > 0 ORDER BY timestamp",
+                "SELECT yes_price FROM price_snapshots WHERE ticker = %s AND yes_price > 0 ORDER BY timestamp",
                 (r["ticker"],)
             )
             prices = [sr["yes_price"] for sr in std_rows]
@@ -267,7 +267,7 @@ class PriceAnalyzer:
             series = self._query(
                 """SELECT timestamp, yes_price, yes_bid, yes_ask
                    FROM price_snapshots
-                   WHERE ticker = ? AND yes_price > 0
+                   WHERE ticker = %s AND yes_price > 0
                    ORDER BY timestamp""",
                 (r["ticker"],)
             )
@@ -325,7 +325,7 @@ class PriceAnalyzer:
             ticker = row["ticker"]
             series = self._query(
                 """SELECT timestamp, yes_price FROM price_snapshots
-                   WHERE ticker = ? AND yes_price > 0
+                   WHERE ticker = %s AND yes_price > 0
                    ORDER BY timestamp""",
                 (ticker,)
             )
@@ -373,16 +373,14 @@ class PriceAnalyzer:
 
         # Get latest snapshot per ticker with market info
         latest = self._query("""
-            SELECT s.ticker, s.yes_bid, s.yes_ask, s.yes_price,
+            SELECT DISTINCT ON (s.ticker)
+                   s.ticker, s.yes_bid, s.yes_ask, s.yes_price,
                    s.volume, s.open_interest, s.timestamp,
                    m.title, m.category, m.sub_category, m.liquidity_grade
             FROM price_snapshots s
             JOIN markets m ON s.ticker = m.ticker
             WHERE s.yes_bid > 0 AND s.yes_ask > 0
-            AND s.rowid IN (
-                SELECT MAX(rowid) FROM price_snapshots
-                WHERE yes_bid > 0 GROUP BY ticker
-            )
+            ORDER BY s.ticker, s.id DESC
         """)
 
         if not latest:
@@ -605,7 +603,8 @@ class PriceAnalyzer:
         return report
 
     def close(self):
-        self.conn.close()
+        put_connection(self.conn)
+        self.conn = None
 
 
 # ============================================================================

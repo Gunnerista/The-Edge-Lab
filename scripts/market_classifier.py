@@ -29,7 +29,6 @@ Usage:
 
 import sys
 import re
-import sqlite3
 import logging
 import argparse
 from datetime import datetime, timezone
@@ -39,10 +38,11 @@ from dataclasses import dataclass
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from db import get_connection, put_connection
+
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DB_PATH = PROJECT_ROOT / "data" / "market_data.db"
 
 
 # ============================================================================
@@ -274,32 +274,10 @@ def is_tradeable(
 # ============================================================================
 
 class MarketClassifier:
-    """Classifies markets from the market_data.db database."""
+    """Classifies markets from the PostgreSQL warmachine database."""
 
-    def __init__(self, db_path: Path = DB_PATH):
-        self.db_path = db_path
-        self.conn = sqlite3.connect(str(db_path))
-        self._ensure_columns()
-
-    def _ensure_columns(self):
-        """Add classification columns to markets table if they don't exist."""
-        cur = self.conn.cursor()
-        existing = {row[1] for row in cur.execute("PRAGMA table_info(markets)").fetchall()}
-
-        new_cols = {
-            "sub_category": "TEXT DEFAULT ''",
-            "market_type": "TEXT DEFAULT ''",
-            "liquidity_grade": "TEXT DEFAULT ''",
-            "tradeable": "INTEGER DEFAULT 0",
-            "classified_at": "TEXT DEFAULT ''",
-        }
-
-        for col, typedef in new_cols.items():
-            if col not in existing:
-                cur.execute(f"ALTER TABLE markets ADD COLUMN {col} {typedef}")
-                logger.info(f"Added column: {col}")
-
-        self.conn.commit()
+    def __init__(self):
+        self.conn = get_connection()
 
     def classify_market(self, ticker: str, title: str, event_ticker: str) -> Tuple[str, str, str, float]:
         """
@@ -368,7 +346,7 @@ class MarketClassifier:
 
         logger.info(f"Classifying {len(rows)} markets...")
 
-        # Get latest price data for liquidity grading
+        # Get latest price data for liquidity grading (last 10 min only)
         price_cache = {}
         cur.execute("""
             SELECT ticker,
@@ -378,6 +356,7 @@ class MarketClassifier:
                    MAX(open_interest) as oi
             FROM price_snapshots
             WHERE source = 'rest'
+              AND timestamp >= NOW() - INTERVAL '10 minutes'
             GROUP BY ticker
         """)
         for row in cur.fetchall():
@@ -411,9 +390,9 @@ class MarketClassifier:
         # Batch update
         cur.executemany(
             """UPDATE markets SET
-                category = ?, sub_category = ?, market_type = ?,
-                liquidity_grade = ?, tradeable = ?, classified_at = ?
-               WHERE ticker = ?""",
+                category = %s, sub_category = %s, market_type = %s,
+                liquidity_grade = %s, tradeable = %s, classified_at = %s
+               WHERE ticker = %s""",
             updates,
         )
         self.conn.commit()
@@ -488,10 +467,10 @@ class MarketClassifier:
         """
         params = []
         if category:
-            query += " AND m.category = ?"
+            query += " AND m.category = %s"
             params.append(category)
 
-        query += " ORDER BY s.volume DESC LIMIT ?"
+        query += " ORDER BY s.volume DESC LIMIT %s"
         params.append(limit)
 
         cur.execute(query, params)
@@ -514,7 +493,8 @@ class MarketClassifier:
         ]
 
     def close(self):
-        self.conn.close()
+        put_connection(self.conn)
+        self.conn = None
 
 
 # ============================================================================

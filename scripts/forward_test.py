@@ -27,6 +27,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from nba_model import NBAModel
 from tz import ET
 from db import get_connection, put_connection
+from bankroll import kelly_bet_size
+from safety import SafetyManager
 
 try:
     import requests as _requests
@@ -39,9 +41,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 LOG_FILE = PROJECT_ROOT / "data" / "prediction_log.jsonl"
 
 # Prop types we model
-PROP_PREFIXES = ["KXNBAPTS", "KXNBAREB"]  # assists disabled (v4: -27.8% ROI)
-PROP_TYPE_MAP = {"KXNBAPTS": "points", "KXNBAREB": "rebounds"}
-CONFIG_VERSION = "v4_edge_optimized"
+PROP_PREFIXES = ["KXNBAPTS", "KXNBAREB", "KXNBAAST"]  # assists re-enabled (v5_kelly)
+PROP_TYPE_MAP = {"KXNBAPTS": "points", "KXNBAREB": "rebounds", "KXNBAAST": "assists"}
+CONFIG_VERSION = "v5_kelly"
 
 # Maps The Odds API full team name → Kalshi 3-letter abbreviation
 _TEAM_NAME_TO_ABBR = {
@@ -152,10 +154,8 @@ def extract_matchup(ticker: str):
 
 def date_to_ticker_pattern(d: date) -> str:
     """Convert date to ticker date segment pattern: 26MAR28 for 2026-03-28."""
-    yy = str(d.year)[-2:]
-    mon = d.strftime("%b").upper()
-    dd = f"{d.day:02d}"
-    return f"{yy}{mon}{dd}"
+    from tz import ticker_date_pattern
+    return ticker_date_pattern(d)
 
 
 def get_active_props(dates: list[date]) -> list[dict]:
@@ -231,6 +231,11 @@ def run_forward_test(dates: list[date], source: str = "auto-cli"):
     model = NBAModel()
     prediction_time = datetime.now(timezone.utc).isoformat()
 
+    # Get current bankroll for Kelly sizing
+    safety = SafetyManager()
+    current_bankroll = safety.bankroll
+    KELLY_FRACTION = 0.25
+
     predictions = []
     skipped = 0
 
@@ -267,6 +272,30 @@ def run_forward_test(dates: list[date], source: str = "auto-cli"):
         matchup = extract_matchup(ticker)
         pre_game_spread = game_spreads.get(matchup) if matchup else None
 
+        # Kelly sizing: determine betable side and entry price
+        yes_bid = prop.get("yes_bid") or 0
+        yes_ask = prop.get("yes_ask") or 0
+        if edge > 0:
+            # YES side favorable
+            k_entry = yes_ask if yes_ask > 0 else kalshi_price
+            k_odds = (1 - k_entry) / k_entry if k_entry > 0 and k_entry < 1 else 0
+        else:
+            # NO side favorable
+            k_entry = (1 - yes_bid) if yes_bid > 0 else (1 - kalshi_price)
+            k_odds = (1 - k_entry) / k_entry if k_entry > 0 and k_entry < 1 else 0
+
+        k_edge = abs(edge)
+        k_bet = kelly_bet_size(k_edge, k_odds, current_bankroll, KELLY_FRACTION) if k_odds > 0 else 0
+        # Full Kelly pct for analysis
+        if k_odds > 0:
+            p = k_edge + (1 / (1 + k_odds))
+            q = 1 - p
+            k_full_pct = max(0, (k_odds * p - q) / k_odds)
+        else:
+            k_full_pct = 0
+        # Contracts
+        k_contracts = max(1, int(k_bet / (k_entry * 100) * 100)) if k_bet > 0 and k_entry > 0 else 0
+
         entry = {
             "ticker": ticker,
             "player": result.player_name,
@@ -286,6 +315,11 @@ def run_forward_test(dates: list[date], source: str = "auto-cli"):
             "actual_result": None,
             "settled": False,
             "config_version": CONFIG_VERSION,
+            "kelly_fraction": KELLY_FRACTION,
+            "kelly_bet_size": round(k_bet, 2),
+            "kelly_full_pct": round(k_full_pct, 4),
+            "bet_contracts": k_contracts,
+            "execution_mode": "live" if result.prop_type == "rebounds" else "paper",
         }
         predictions.append(entry)
 

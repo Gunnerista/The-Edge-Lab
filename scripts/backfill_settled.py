@@ -16,7 +16,6 @@ Usage:
 import sys
 import time
 import json
-import sqlite3
 import logging
 import argparse
 from datetime import datetime, timezone
@@ -25,11 +24,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from kalshi_client import create_client
+from db import get_connection, put_connection
 
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-MARKET_DB = PROJECT_ROOT / "data" / "market_data.db"
 
 SERIES_MAP = {
     "PTS": "KXNBAPTS",
@@ -69,79 +68,84 @@ def fetch_all_settled(client, series_ticker: str) -> list[dict]:
     return all_markets
 
 
-def store_markets(db_path: Path, markets: list[dict]):
+def store_markets(markets: list[dict]):
     """Upsert settled markets into both tables."""
-    conn = sqlite3.connect(str(db_path))
+    conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
 
     inserted_markets = 0
     inserted_settled = 0
     updated_result = 0
 
-    for m in markets:
-        ticker = m.get("ticker", "")
-        result = m.get("result", "")
+    try:
+        cur = conn.cursor()
+        for m in markets:
+            ticker = m.get("ticker", "")
+            result = m.get("result", "")
 
-        # Upsert into markets table
-        existing = conn.execute("SELECT result FROM markets WHERE ticker = ?", (ticker,)).fetchone()
+            # Upsert into markets table
+            cur.execute("SELECT result FROM markets WHERE ticker = %s", (ticker,))
+            existing = cur.fetchone()
 
-        if existing is None:
-            conn.execute("""
-                INSERT INTO markets (ticker, event_ticker, title, subtitle, category,
-                    status, close_time, expiration_time, result, first_seen, last_updated,
-                    sub_category, market_type)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                ticker,
-                m.get("event_ticker", ""),
-                m.get("title", ""),
-                m.get("subtitle", ""),
-                m.get("category", ""),
-                m.get("status", "settled"),
-                m.get("close_time", ""),
-                m.get("expiration_time", ""),
-                result,
-                now,
-                now,
-                m.get("sub_category", ""),
-                m.get("market_type", ""),
-            ))
-            inserted_markets += 1
-        else:
-            if existing[0] != result:
-                conn.execute(
-                    "UPDATE markets SET result = ?, status = 'settled', last_updated = ? WHERE ticker = ?",
-                    (result, now, ticker)
-                )
-                updated_result += 1
+            if existing is None:
+                cur.execute("""
+                    INSERT INTO markets (ticker, event_ticker, title, subtitle, category,
+                        status, close_time, expiration_time, result, first_seen, last_updated,
+                        sub_category, market_type)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    ticker,
+                    m.get("event_ticker", ""),
+                    m.get("title", ""),
+                    m.get("subtitle", ""),
+                    m.get("category", ""),
+                    m.get("status", "settled"),
+                    m.get("close_time", ""),
+                    m.get("expiration_time", ""),
+                    result,
+                    now,
+                    now,
+                    m.get("sub_category", ""),
+                    m.get("market_type", ""),
+                ))
+                inserted_markets += 1
+            else:
+                if existing[0] != result:
+                    cur.execute(
+                        "UPDATE markets SET result = %s, status = 'settled', last_updated = %s WHERE ticker = %s",
+                        (result, now, ticker)
+                    )
+                    updated_result += 1
 
-        # Upsert into settled_markets table
-        exists_settled = conn.execute(
-            "SELECT 1 FROM settled_markets WHERE ticker = ?", (ticker,)
-        ).fetchone()
+            # Upsert into settled_markets table
+            cur.execute(
+                "SELECT 1 FROM settled_markets WHERE ticker = %s", (ticker,)
+            )
+            exists_settled = cur.fetchone()
 
-        if not exists_settled:
-            conn.execute("""
-                INSERT INTO settled_markets (ticker, event_ticker, title, category, result,
-                    last_yes_bid, last_yes_ask, last_yes_mid, volume, close_time, fetched_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                ticker,
-                m.get("event_ticker", ""),
-                m.get("title", ""),
-                m.get("category", ""),
-                result,
-                m.get("yes_bid", 0),
-                m.get("yes_ask", 0),
-                (m.get("yes_bid", 0) + m.get("yes_ask", 0)) / 2,
-                m.get("volume", 0),
-                m.get("close_time", ""),
-                now,
-            ))
-            inserted_settled += 1
+            if not exists_settled:
+                cur.execute("""
+                    INSERT INTO settled_markets (ticker, event_ticker, title, category, result,
+                        last_yes_bid, last_yes_ask, last_yes_mid, volume, close_time, fetched_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    ticker,
+                    m.get("event_ticker", ""),
+                    m.get("title", ""),
+                    m.get("category", ""),
+                    result,
+                    m.get("yes_bid", 0),
+                    m.get("yes_ask", 0),
+                    (m.get("yes_bid", 0) + m.get("yes_ask", 0)) / 2,
+                    m.get("volume", 0),
+                    m.get("close_time", ""),
+                    now,
+                ))
+                inserted_settled += 1
 
-    conn.commit()
-    conn.close()
+        conn.commit()
+    finally:
+        put_connection(conn)
 
     return inserted_markets, updated_result, inserted_settled
 
@@ -192,7 +196,7 @@ def main():
         return
 
     # Store to DB
-    inserted_m, updated_r, inserted_s = store_markets(MARKET_DB, all_markets)
+    inserted_m, updated_r, inserted_s = store_markets(all_markets)
 
     print()
     print("=" * 70)

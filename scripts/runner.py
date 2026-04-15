@@ -6,7 +6,6 @@ Runs two loops simultaneously:
   1. Observer: Records all market data every 60s
   2. Scanner: Runs arbitrage + orderbook scan every 5 minutes
 
-Sends Discord alerts for signals, errors, and daily summary.
 Auto-restarts on crash (5s delay).
 
 Usage:
@@ -50,200 +49,9 @@ from active_scanner import ActiveScanner
 from signal_engine import SignalEngine
 from learning_log import LearningLog
 
-import requests
-
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-def _get_webhook():
-    return os.environ.get("DISCORD_WEBHOOK_URL", "")
-
-# ============================================================================
-# Discord Alert Helpers
-# ============================================================================
-
-def discord_send(embed: dict):
-    """Send a Discord embed. Silently fails if no webhook configured."""
-    if not _get_webhook():
-        return
-    try:
-        requests.post(_get_webhook(), json={"embeds": [embed]}, timeout=10)
-    except Exception as e:
-        logger.error(f"Discord send failed: {e}")
-
-
-def alert_signal(signal_data: dict):
-    """Send signal detection alert."""
-    discord_send({
-        "title": f"Signal: {signal_data.get('signal_type', '?')}",
-        "color": 0x4CAF50,
-        "fields": [
-            {"name": "Market", "value": str(signal_data.get("title", "?"))[:100], "inline": False},
-            {"name": "Side", "value": signal_data.get("side", "?").upper(), "inline": True},
-            {"name": "Price", "value": f"{signal_data.get('price', 0)*100:.0f}c", "inline": True},
-            {"name": "Edge", "value": f"{signal_data.get('edge', 0)*100:.1f}%", "inline": True},
-            {"name": "EV", "value": f"{signal_data.get('ev_cents', 0):.1f}c", "inline": True},
-            {"name": "Confidence", "value": signal_data.get("confidence", "?"), "inline": True},
-            {"name": "Settlement", "value": signal_data.get("expiration", "?")[:19], "inline": True},
-        ],
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    })
-
-
-def alert_execution(trade_data: dict):
-    """Send trade execution alert."""
-    discord_send({
-        "title": "Trade Executed",
-        "color": 0x2196F3,
-        "fields": [
-            {"name": "Ticker", "value": trade_data.get("ticker", "?"), "inline": False},
-            {"name": "Side", "value": trade_data.get("side", "?").upper(), "inline": True},
-            {"name": "Price", "value": f"{trade_data.get('price', 0)}c", "inline": True},
-            {"name": "Count", "value": str(trade_data.get("count", 0)), "inline": True},
-            {"name": "Cost", "value": f"${trade_data.get('cost', 0):.2f}", "inline": True},
-        ],
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    })
-
-
-def alert_daily_summary(summary: dict):
-    """Send daily P&L summary."""
-    discord_send({
-        "title": "Daily Summary",
-        "color": 0x9C27B0,
-        "fields": [
-            {"name": "P&L", "value": f"${summary.get('pnl', 0):.2f}", "inline": True},
-            {"name": "Balance", "value": f"${summary.get('balance', 0):.2f}", "inline": True},
-            {"name": "Open Positions", "value": str(summary.get('positions', 0)), "inline": True},
-            {"name": "Signals Today", "value": str(summary.get('signals', 0)), "inline": True},
-            {"name": "Markets Recorded", "value": f"{summary.get('markets', 0):,}", "inline": True},
-            {"name": "Settling Tomorrow", "value": str(summary.get('settling_tomorrow', 0)), "inline": True},
-        ],
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    })
-    # Send calibration as separate message if available
-    cal_text = summary.get("calibration", "")
-    if cal_text:
-        discord_send({
-            "title": "Calibration",
-            "color": 0x607D8B,
-            "description": cal_text,
-        })
-
-
-def alert_error(error_msg: str):
-    """Send error alert."""
-    discord_send({
-        "title": "ERROR",
-        "color": 0xF44336,
-        "description": error_msg[:500],
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    })
-
-
-def send_player_report(today_str: str):
-    """Send daily player performance report (v2 config only) to Discord."""
-    KALSHI_FEE = 0.07
-    STARTING_BANKROLL = 300.0
-    CONFIG_V2 = "v3_prop_edge"
-
-    pred_log_path = PROJECT_ROOT / "data" / "prediction_log.jsonl"
-    if not pred_log_path.exists():
-        discord_send({
-            "title": "📊 데일리 플레이어 리포트",
-            "color": 0x607D8B,
-            "description": "오늘 정산 없음",
-        })
-        return
-
-    all_v2_settled = []
-    today_v2_settled = []
-    with open(pred_log_path, "r", encoding="utf-8") as _f:
-        for _line in _f:
-            _line = _line.strip()
-            if not _line:
-                continue
-            try:
-                p = json.loads(_line)
-            except Exception:
-                continue
-            if (p.get("config_version") == CONFIG_V2
-                    and p.get("settled")
-                    and p.get("actual_result") in ("yes", "no")):
-                all_v2_settled.append(p)
-                if p.get("game_date") == today_str:
-                    today_v2_settled.append(p)
-
-    if not today_v2_settled:
-        discord_send({
-            "title": "📊 데일리 플레이어 리포트",
-            "color": 0x607D8B,
-            "description": "오늘 정산 없음",
-        })
-        return
-
-    def _pred_pnl(p):
-        buy_price = p.get("kalshi_price") or 0.5
-        model_p = p.get("model_prob", 0.5)
-        bet_yes = model_p > buy_price
-        entry = buy_price if bet_yes else (1 - buy_price)
-        won = (p["actual_result"] == "yes") if bet_yes else (p["actual_result"] == "no")
-        return (1 - entry) * (1 - KALSHI_FEE) if won else -entry
-
-    def _pred_side(p):
-        return "YES" if (p.get("model_prob", 0.5) > (p.get("kalshi_price") or 0.5)) else "NO"
-
-    def _fmt_pnl(v):
-        return f"+${v:.2f}" if v >= 0 else f"-${abs(v):.2f}"
-
-    # Today stats
-    today_pnls = [(p, _pred_pnl(p)) for p in today_v2_settled]
-    today_wins = sum(1 for _, pnl in today_pnls if pnl > 0)
-    today_losses = len(today_pnls) - today_wins
-    winrate = round(today_wins / len(today_pnls) * 100, 1)
-    today_pnl = sum(pnl for _, pnl in today_pnls)
-
-    # Cumulative v2 stats
-    all_pnl = sum(_pred_pnl(p) for p in all_v2_settled)
-    n_settled = len(all_v2_settled)
-    total_cost = sum(
-        (p.get("kalshi_price") or 0.5) if (p.get("model_prob", 0.5) > (p.get("kalshi_price") or 0.5))
-        else (1 - (p.get("kalshi_price") or 0.5))
-        for p in all_v2_settled
-    )
-    roi = round(all_pnl / total_cost * 100, 1) if total_cost > 0 else 0.0
-    virtual_bankroll = STARTING_BANKROLL + all_pnl
-
-    # Best and worst today
-    today_pnls_sorted = sorted(today_pnls, key=lambda x: x[1])
-    worst_p, worst_pnl = today_pnls_sorted[0]
-    best_p, best_pnl = today_pnls_sorted[-1]
-
-    def _fmt_player(p):
-        return f"{p.get('player', '?')} {p.get('prop_type', '?')} {p.get('line', '?')} {_pred_side(p)}"
-
-    color = 0x4CAF50 if today_pnl >= 0 else 0xF44336
-    description = "\n".join([
-        "📊 **오늘 결과**",
-        f"├ 승패: {today_wins}승 {today_losses}패 (승률 {winrate}%)",
-        f"├ 오늘 P&L: {_fmt_pnl(today_pnl)}",
-        f"└ 잔고: ${virtual_bankroll:.2f} (시작 $300)",
-        "",
-        "📈 **누적 (new config v2 only)**",
-        f"├ 총 settled: {n_settled}건",
-        f"├ 누적 ROI: {roi}% (fee 반영)",
-        f"└ 누적 P&L: {_fmt_pnl(all_pnl)}",
-        "",
-        f"🏆 **오늘 베스트**: {_fmt_player(best_p)} → {_fmt_pnl(best_pnl)}",
-        f"💀 **오늘 워스트**: {_fmt_player(worst_p)} → {_fmt_pnl(worst_pnl)}",
-    ])
-
-    discord_send({
-        "title": "📊 데일리 플레이어 리포트",
-        "color": color,
-        "description": description,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    })
 
 
 def save_equity_curve_point(today_str: str):
@@ -314,6 +122,18 @@ def save_equity_curve_point(today_str: str):
     has_v2 = any(p.get("config_version") == "v3_prop_edge" for p in all_settled)
     config_version = "v3_prop_edge" if has_v2 else "legacy"
 
+    # Fetch actual Kalshi balance for live trades
+    kalshi_balance = None
+    try:
+        from kalshi_client import KalshiConfig, create_client
+        _kconfig = KalshiConfig.from_env()
+        _kconfig.use_demo = False
+        _kclient = create_client(_kconfig)
+        _bal = _kclient.get_balance()
+        kalshi_balance = round((_bal.get("balance", 0) + _bal.get("portfolio_value", 0)) / 100, 2)
+    except Exception as _e:
+        logger.warning(f"[Equity] Could not fetch Kalshi balance: {_e}")
+
     entry = {
         "date": today_str,
         "config_version": config_version,
@@ -323,6 +143,7 @@ def save_equity_curve_point(today_str: str):
         "settled_cumulative": len(all_settled),
         "win_rate": win_rate,
         "roi": roi,
+        "kalshi_balance": kalshi_balance,
     }
     curve.append(entry)
     curve.sort(key=lambda x: x.get("date", ""))
@@ -365,7 +186,6 @@ def observer_loop(interval: int = 60, stop_event: threading.Event = None):
             logger.info(f"[Observer] Cycle {cycle}: {count} markets ({elapsed:.1f}s)")
         except Exception as e:
             logger.error(f"[Observer] Cycle {cycle} failed: {e}")
-            alert_error(f"Observer error: {e}")
 
         sleep_time = max(0, interval - (time.time() - start))
         if stop_event:
@@ -469,7 +289,6 @@ def scanner_loop(
 
         except Exception as e:
             logger.error(f"[Scanner] Cycle {cycle} failed: {e}")
-            alert_error(f"Scanner error: {e}")
 
         sleep_time = max(0, interval - (time.time() - start))
         if stop_event:
@@ -555,7 +374,6 @@ def run_scheduled_tasks():
             logger.info("[Scheduler] Forward test complete")
         except Exception as e:
             logger.error(f"[Scheduler] Forward test failed: {e}")
-            alert_error(f"Forward test failed: {e}")
 
     # 11:59 PM ET — Settle predictions (retry up to 3x on DB lock)
     if now.hour == 23 and now.minute >= 55 and not _settle_done_today:
@@ -574,7 +392,6 @@ def run_scheduled_tasks():
                     time.sleep(60)
                 else:
                     logger.error(f"[Scheduler] Settle failed (attempt {attempt}/{max_retries}): {e}")
-                    alert_error(f"Settle predictions failed: {e}")
                     break
 
 
@@ -583,100 +400,18 @@ def run_scheduled_tasks():
 # ============================================================================
 
 def send_daily_summary_if_due():
-    """Check if it's time for daily summary (10pm ET). Runs once per day."""
+    """Run 10pm ET daily tasks once per day (self-learner parameter tuning)."""
     global _daily_summary_done_today
     now = _now_et()
     if now.hour == 22 and now.minute < 2 and not _daily_summary_done_today:
         _daily_summary_done_today = True
         try:
-            config = KalshiConfig.from_env()
-            config.use_demo = False
-            client = create_client(config)
-            bal = client.get_balance()
-            balance = bal.get("balance", 0) / 100  # cents to dollars
-
-            from trade_engine import TradeLogger, PositionManager
-            tl = TradeLogger()
-            pm = PositionManager()
-            pnl_data = tl.get_pnl_summary()
-
-            learn = LearningLog()
-            today_signals = len([
-                e for e in learn.get_recent(1000, "signal_detected")
-                if e.get("logged_at", "")[:10] == now.strftime("%Y-%m-%d")
-            ])
-
-            # Brier Score: prediction_log settled predictions + new Platt
-            import math as _math
-            import json as _json
-            PLATT_A, PLATT_B = 0.8976, -0.4242
-            def _sigmoid(z): return 1/(1+_math.exp(-z)) if z >= 0 else _math.exp(z)/(1+_math.exp(z))
-            def _apply_platt(p):
-                p = max(0.001, min(0.999, p))
-                return _sigmoid(PLATT_A * _math.log(p/(1-p)) + PLATT_B)
-            pred_log_path = PROJECT_ROOT / "data" / "prediction_log.jsonl"
-            brier_score = None
-            if pred_log_path.exists():
-                brier_preds = []
-                with open(pred_log_path, "r", encoding="utf-8") as _f:
-                    for _line in _f:
-                        _line = _line.strip()
-                        if not _line: continue
-                        try:
-                            _p = _json.loads(_line)
-                        except Exception:
-                            continue
-                        if _p.get("settled") and _p.get("actual_result") in ("yes", "no"):
-                            brier_preds.append(_p)
-                if brier_preds:
-                    brier_score = sum(
-                        (_apply_platt(_p.get("model_prob", 0.5)) - (1 if _p["actual_result"] == "yes" else 0)) ** 2
-                        for _p in brier_preds
-                    ) / len(brier_preds)
-
-            # Build calibration summary with Brier override
-            from calibration import CalibrationTracker
-            cal = CalibrationTracker()
-            cal_summary = cal.format_discord_summary()
-            if brier_score is not None:
-                cal_summary = f"Brier={brier_score:.4f} (platt, n={len(brier_preds)}) | " + cal_summary
-
-            alert_daily_summary({
-                "balance": pnl_data.get("virtual_bankroll", 300.0),
-                "pnl": pnl_data.get("realized_pnl", 0),
-                "positions": len(pm.get_positions()),
-                "signals": today_signals,
-                "markets": _total_markets_recorded,
-                "settling_tomorrow": 0,
-                "calibration": cal_summary,
-            })
-            # Weekly loss decomposition (Sunday only)
-            if now.weekday() == 6:  # Sunday
-                from risk_decomposition import format_discord_weekly, generate_loss_report
-                loss_report = generate_loss_report()
-                if loss_report["total_losses"] > 0:
-                    discord_send({
-                        "title": "Weekly Loss Decomposition",
-                        "color": 0xFF5722,
-                        "description": format_discord_weekly(loss_report),
-                    })
-
             # Self-learner: auto-tune parameters
             from self_learner import SelfLearner
             learner = SelfLearner()
-            changes = learner.run_tuning_cycle()
-            if changes:
-                discord_send({
-                    "title": "\U0001f9e0 Parameter Auto-Tune",
-                    "color": 0x00BCD4,
-                    "description": "\n".join(
-                        f"**{k}**: {v['old']} \u2192 {v['new']}"
-                        for k, v in changes.items()
-                    ),
-                })
-
+            learner.run_tuning_cycle()
         except Exception as e:
-            logger.error(f"Daily summary failed: {e}")
+            logger.error(f"Daily tasks failed: {e}")
 
 
 # ============================================================================
@@ -727,10 +462,8 @@ def _startup_catchup_forward_test():
     try:
         conn = get_connection()
         # Build ticker date pattern (e.g., 26MAR28 for 2026-03-28)
-        yy = str(now.year)[-2:]
-        mon = now.strftime("%b").upper()
-        dd = f"{now.day:02d}"
-        pattern = f"KXNBAPTS-{yy}{mon}{dd}%"
+        from tz import ticker_date_pattern
+        pattern = f"KXNBAPTS-{ticker_date_pattern(now)}%"
         cur = conn.cursor()
         cur.execute(
             "SELECT COUNT(*) FROM markets WHERE ticker LIKE %s AND status = 'active'",
@@ -762,7 +495,6 @@ def _startup_catchup_forward_test():
         logger.info("[Catchup] Forward test catch-up complete")
     except Exception as e:
         logger.error(f"[Catchup] Forward test catch-up failed: {e}")
-        alert_error(f"Catchup forward test failed: {e}")
 
 
 # ============================================================================
@@ -851,12 +583,14 @@ def main():
     settlement_hours = 0 if args.no_settlement_filter else args.max_settlement_hours
     auto_trade = not args.no_auto_trade and not args.observe_only
 
-    # === PAPER TRADING MODE — all auto-trades forced to dry-run ===
-    PAPER_TRADING = True
+    # === HYBRID TRADING MODE — per-prop-type live/paper routing ===
+    # Live prop types defined in auto_trader.LIVE_PROP_TYPES (currently: rebounds only).
+    # Set PAPER_TRADING = True to force ALL trades to paper (emergency override).
+    PAPER_TRADING = False
     if PAPER_TRADING:
         args.dry_run = True
 
-    trade_mode = "PAPER" if PAPER_TRADING else ("DRY RUN" if args.dry_run else ("LIVE" if auto_trade else "OFF"))
+    trade_mode = "PAPER" if PAPER_TRADING else ("DRY RUN" if args.dry_run else ("HYBRID (rebounds=LIVE)" if auto_trade else "OFF"))
 
     print()
     print("  ====================================================")
@@ -868,7 +602,6 @@ def main():
     print(f"  Auto-Trade:  {trade_mode}")
     print(f"  Scheduled:   Forward test 12:00pm ET, Settle 11:59pm ET")
     print(f"  Settlement:  {settlement_hours}h filter" if settlement_hours else "  Settlement:  No filter")
-    print(f"  Discord:     {'Configured' if _get_webhook() else 'Not set (DISCORD_WEBHOOK_URL)'}")
     print("  ====================================================")
     print()
 
@@ -905,13 +638,6 @@ def main():
         t.start()
         logger.info(f"Started thread: {t.name}")
 
-    if PAPER_TRADING:
-        discord_send({
-            "title": "\U0001f52c PAPER TRADING MODE",
-            "description": "\uc2e4\ub9e4\ub9e4 \uc911\ub2e8, \uc804\ub7b5 \uac80\uc99d \uc911. \uc2dc\uadf8\ub110 \uac10\uc9c0 + \uac00\uc0c1 \ub9e4\ub9e4 \uae30\ub85d\ub9cc \ud568.",
-            "color": 0x9C27B0,
-        })
-
     # Startup catch-up: if 12pm ET already passed today and no auto predictions exist,
     # run forward test immediately (e.g., runner started at 6pm)
     _startup_catchup_forward_test()
@@ -927,11 +653,6 @@ def main():
                 if not player_report_sent:
                     player_report_sent = True
                     today_str_report = first_tipoff.strftime("%Y-%m-%d")
-                    logger.info("[Schedule] Sending daily player report...")
-                    try:
-                        send_player_report(today_str_report)
-                    except Exception as _rpt_err:
-                        logger.error(f"[Schedule] Player report failed: {_rpt_err}")
                     logger.info("[Schedule] Saving equity curve point...")
                     try:
                         save_equity_curve_point(today_str_report)

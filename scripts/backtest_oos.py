@@ -20,7 +20,6 @@ Usage:
 import sys
 import json
 import math
-import sqlite3
 import logging
 import argparse
 import time
@@ -31,11 +30,11 @@ from collections import defaultdict
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from db import get_connection, put_connection
+
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-MARKET_DB = PROJECT_ROOT / "data" / "market_data.db"
-NBA_DB = PROJECT_ROOT / "data" / "nba_data.db"
 GAMELOG_CACHE = PROJECT_ROOT / "data" / "gamelogs_cache.json"
 REPORT_FILE = PROJECT_ROOT / "data" / "backtest_oos_report.json"
 IS_REPORT = PROJECT_ROOT / "data" / "backtest_report.json"
@@ -70,21 +69,22 @@ def prob_over(projected: float, std_dev: float, line: float) -> float:
 # Step 1: Fetch game logs
 # ============================================================================
 
-def resolve_players(db_path: Path) -> dict:
+def resolve_players() -> dict:
     """Map player_segment from tickers to (player_name, player_id, team_abbr)."""
-    conn_market = sqlite3.connect(str(MARKET_DB))
-    conn_nba = sqlite3.connect(str(db_path))
-    conn_nba.row_factory = sqlite3.Row
+    conn = get_connection(dict_cursor=True)
 
     # Get unique player segments from settled tickers
-    rows = conn_market.execute("""
+    cur = conn.cursor()
+    cur.execute("""
         SELECT DISTINCT ticker FROM settled_markets
         WHERE (ticker LIKE 'KXNBAPTS%' OR ticker LIKE 'KXNBAREB%' OR ticker LIKE 'KXNBAAST%')
         AND close_time >= '2026-01-01'
-    """).fetchall()
+    """)
+    rows = cur.fetchall()
 
     segments = set()
-    for (ticker,) in rows:
+    for row in rows:
+        ticker = row["ticker"]
         parts = ticker.split("-")
         if len(parts) >= 3:
             segments.add(parts[2])
@@ -105,12 +105,13 @@ def resolve_players(db_path: Path) -> dict:
         last_name = m.group(3).capitalize()
 
         # Find in nba_players
-        row = conn_nba.execute(
+        cur.execute(
             """SELECT player_id, player_name, team_abbr FROM nba_players
-               WHERE player_name LIKE ? AND season = '2025-26' AND games_played >= 5
+               WHERE player_name LIKE %s AND season = '2025-26' AND games_played >= 5
                LIMIT 1""",
             (f"% {last_name}%",)
-        ).fetchone()
+        )
+        row = cur.fetchone()
 
         if row:
             player_map[seg] = {
@@ -119,8 +120,7 @@ def resolve_players(db_path: Path) -> dict:
                 "team_abbr": row["team_abbr"],
             }
 
-    conn_market.close()
-    conn_nba.close()
+    put_connection(conn)
 
     logger.info(f"[OOS] Resolved {len(player_map)}/{len(segments)} player segments")
     return player_map
@@ -355,11 +355,12 @@ def parse_ticker_light(ticker: str):
 
 def load_team_data() -> dict:
     """Load current team stats from nba_data.db."""
-    conn = sqlite3.connect(str(NBA_DB))
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute("SELECT * FROM nba_teams WHERE season = '2025-26'").fetchall()
+    conn = get_connection(dict_cursor=True)
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM nba_teams WHERE season = '2025-26'")
+    rows = cur.fetchall()
     teams = {row["team_abbr"]: dict(row) for row in rows}
-    conn.close()
+    put_connection(conn)
     return teams
 
 
@@ -371,7 +372,7 @@ def run_oos_backtest(skip_fetch: bool = False):
     )
 
     # Resolve players
-    player_map = resolve_players(NBA_DB)
+    player_map = resolve_players()
 
     # Fetch or load game logs
     if skip_fetch and GAMELOG_CACHE.exists():
@@ -394,9 +395,9 @@ def run_oos_backtest(skip_fetch: bool = False):
     teams = load_team_data()
 
     # Load settled markets (Jan 1+)
-    conn = sqlite3.connect(str(MARKET_DB))
-    conn.row_factory = sqlite3.Row
-    markets = conn.execute("""
+    conn = get_connection(dict_cursor=True)
+    cur = conn.cursor()
+    cur.execute("""
         SELECT s.ticker, s.title, s.result, s.close_time,
                p.yes_price as kalshi_price
         FROM settled_markets s
@@ -408,9 +409,9 @@ def run_oos_backtest(skip_fetch: bool = False):
         WHERE (s.ticker LIKE 'KXNBAPTS%' OR s.ticker LIKE 'KXNBAREB%' OR s.ticker LIKE 'KXNBAAST%')
         AND s.close_time >= '2026-01-01'
         ORDER BY s.close_time
-    """).fetchall()
-    conn.close()
-    markets = [dict(r) for r in markets]
+    """)
+    markets = [dict(r) for r in cur.fetchall()]
+    put_connection(conn)
 
     logger.info(f"[OOS] Processing {len(markets)} markets (Jan 1+)")
 

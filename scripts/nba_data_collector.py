@@ -14,7 +14,7 @@ Data Sources:
   2. Basketball Reference (web scrape) — Team defensive stats by position,
      opponent shooting splits
 
-Storage: SQLite (data/market_data.db)
+Storage: PostgreSQL (warmachine DB)
   - nba_players: player-level stats (season + recent form)
   - nba_teams: team-level defensive stats (opponent allowed by position)
   - nba_games: game-level context (schedule, B2B, home/away)
@@ -34,7 +34,6 @@ Usage:
 import sys
 import time
 import json
-import sqlite3
 import logging
 import argparse
 import traceback
@@ -44,186 +43,15 @@ from typing import Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from psycopg2.extras import RealDictCursor
+from db import get_connection, put_connection
+
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-# Separate DB for NBA stats — market_data.db is 6.7GB + 16GB WAL (Kalshi prices only).
-# Try multiple locations in order of preference
-def _find_writable_db_path() -> Path:
-    import sqlite3 as _sq
-    candidates = [
-        PROJECT_ROOT / "data" / "nba_data.db",
-        Path.home() / "nba_data.db",
-        Path("/tmp") / "nba_data.db",
-    ]
-    # If DB already exists somewhere, use it
-    for c in candidates:
-        if c.exists():
-            return c
-    # Otherwise find first truly writable location (test with actual SQLite)
-    for c in candidates:
-        try:
-            c.parent.mkdir(parents=True, exist_ok=True)
-            conn = _sq.connect(str(c))
-            conn.execute("CREATE TABLE IF NOT EXISTS _write_test (id INTEGER)")
-            conn.execute("DROP TABLE _write_test")
-            conn.close()
-            return c
-        except Exception:
-            # Clean up partial file
-            try:
-                c.unlink()
-            except Exception:
-                pass
-            continue
-    return candidates[-1]
-
-NBA_DB_PATH = _find_writable_db_path()
-DB_PATH = NBA_DB_PATH
 
 # Rate limiting for NBA API (they throttle aggressively)
 API_DELAY = 0.8  # seconds between requests
-
-
-# ============================================================================
-# SQLite Schema for NBA Data
-# ============================================================================
-
-NBA_SCHEMA_SQL = """
--- Player stats: season averages + recent form
-CREATE TABLE IF NOT EXISTS nba_players (
-    player_id       INTEGER,
-    player_name     TEXT NOT NULL,
-    team_abbr       TEXT DEFAULT '',
-    position        TEXT DEFAULT '',
-    season          TEXT NOT NULL,          -- e.g. '2025-26'
-
-    -- Season averages
-    games_played    INTEGER DEFAULT 0,
-    minutes_pg      REAL DEFAULT 0,
-    points_pg       REAL DEFAULT 0,
-    rebounds_pg     REAL DEFAULT 0,
-    assists_pg      REAL DEFAULT 0,
-    steals_pg       REAL DEFAULT 0,
-    blocks_pg       REAL DEFAULT 0,
-    turnovers_pg    REAL DEFAULT 0,
-    fg_pct          REAL DEFAULT 0,
-    fg3_pct         REAL DEFAULT 0,
-    ft_pct          REAL DEFAULT 0,
-    fga_pg          REAL DEFAULT 0,
-    fta_pg          REAL DEFAULT 0,
-    fg3a_pg         REAL DEFAULT 0,
-    plus_minus      REAL DEFAULT 0,
-    usage_rate      REAL DEFAULT 0,
-
-    -- Per-minute rates (for projection when minutes vary)
-    pts_per_min     REAL DEFAULT 0,
-    reb_per_min     REAL DEFAULT 0,
-    ast_per_min     REAL DEFAULT 0,
-
-    -- Recent form (last 10 games)
-    recent_pts_avg  REAL DEFAULT 0,
-    recent_reb_avg  REAL DEFAULT 0,
-    recent_ast_avg  REAL DEFAULT 0,
-    recent_min_avg  REAL DEFAULT 0,
-    recent_pts_std  REAL DEFAULT 0,        -- standard deviation for variance
-    recent_reb_std  REAL DEFAULT 0,
-    recent_ast_std  REAL DEFAULT 0,
-
-    -- Recent form (last 5 games) — higher recency weight
-    recent5_pts_avg REAL DEFAULT 0,
-    recent5_reb_avg REAL DEFAULT 0,
-    recent5_ast_avg REAL DEFAULT 0,
-
-    -- Home/Away splits
-    home_pts_avg    REAL DEFAULT 0,
-    away_pts_avg    REAL DEFAULT 0,
-    home_reb_avg    REAL DEFAULT 0,
-    away_reb_avg    REAL DEFAULT 0,
-    home_ast_avg    REAL DEFAULT 0,
-    away_ast_avg    REAL DEFAULT 0,
-
-    updated_at      TEXT NOT NULL,
-
-    PRIMARY KEY (player_id, season)
-);
-
--- Team defensive stats: how much they allow by position
-CREATE TABLE IF NOT EXISTS nba_teams (
-    team_id         INTEGER,
-    team_abbr       TEXT NOT NULL,
-    team_name       TEXT DEFAULT '',
-    season          TEXT NOT NULL,
-
-    -- Overall defensive metrics
-    opp_pts_pg      REAL DEFAULT 0,        -- opponent points per game
-    opp_reb_pg      REAL DEFAULT 0,
-    opp_ast_pg      REAL DEFAULT 0,
-    opp_fg_pct      REAL DEFAULT 0,
-    opp_fg3_pct     REAL DEFAULT 0,
-    def_rating      REAL DEFAULT 0,        -- defensive rating (pts per 100 poss)
-    pace            REAL DEFAULT 0,        -- possessions per game
-
-    -- Opponent stats allowed by position (PG/SG/SF/PF/C)
-    opp_pg_pts      REAL DEFAULT 0,
-    opp_sg_pts      REAL DEFAULT 0,
-    opp_sf_pts      REAL DEFAULT 0,
-    opp_pf_pts      REAL DEFAULT 0,
-    opp_c_pts       REAL DEFAULT 0,
-    opp_pg_reb      REAL DEFAULT 0,
-    opp_sg_reb      REAL DEFAULT 0,
-    opp_sf_reb      REAL DEFAULT 0,
-    opp_pf_reb      REAL DEFAULT 0,
-    opp_c_reb       REAL DEFAULT 0,
-    opp_pg_ast      REAL DEFAULT 0,
-    opp_sg_ast      REAL DEFAULT 0,
-    opp_sf_ast      REAL DEFAULT 0,
-    opp_pf_ast      REAL DEFAULT 0,
-    opp_c_ast       REAL DEFAULT 0,
-
-    -- Recent form (last 10 games)
-    recent_def_rating   REAL DEFAULT 0,
-    recent_opp_pts_pg   REAL DEFAULT 0,
-    recent_pace         REAL DEFAULT 0,
-
-    updated_at      TEXT NOT NULL,
-
-    PRIMARY KEY (team_id, season)
-);
-
--- Game schedule context
-CREATE TABLE IF NOT EXISTS nba_games (
-    game_id         TEXT PRIMARY KEY,
-    game_date       TEXT NOT NULL,
-    home_team_id    INTEGER,
-    away_team_id    INTEGER,
-    home_team_abbr  TEXT DEFAULT '',
-    away_team_abbr  TEXT DEFAULT '',
-    home_score      INTEGER DEFAULT 0,
-    away_score      INTEGER DEFAULT 0,
-    status          TEXT DEFAULT 'scheduled',  -- scheduled, in_progress, final
-    is_back_to_back_home  INTEGER DEFAULT 0,
-    is_back_to_back_away  INTEGER DEFAULT 0,
-    updated_at      TEXT NOT NULL
-);
-
--- Injury report
-CREATE TABLE IF NOT EXISTS nba_injuries (
-    player_id       INTEGER,
-    player_name     TEXT NOT NULL,
-    team_abbr       TEXT DEFAULT '',
-    status          TEXT DEFAULT '',        -- Out, Doubtful, Questionable, Probable
-    injury_detail   TEXT DEFAULT '',
-    updated_at      TEXT NOT NULL,
-
-    PRIMARY KEY (player_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_nba_players_name ON nba_players(player_name);
-CREATE INDEX IF NOT EXISTS idx_nba_players_team ON nba_players(team_abbr);
-CREATE INDEX IF NOT EXISTS idx_nba_teams_abbr ON nba_teams(team_abbr);
-CREATE INDEX IF NOT EXISTS idx_nba_injuries_team ON nba_injuries(team_abbr);
-"""
 
 
 # ============================================================================
@@ -305,19 +133,14 @@ def _safe_int(val, default: int = 0) -> int:
 
 class NBADataCollector:
     """
-    Collects real NBA data from nba_api and stores in SQLite.
+    Collects real NBA data from nba_api and stores in PostgreSQL.
 
     Data flow:
-      nba_api → parse → SQLite (nba_players, nba_teams, nba_games, nba_injuries)
+      nba_api → parse → PostgreSQL (nba_players, nba_teams, nba_games, nba_injuries)
     """
 
-    def __init__(self, db_path: Path = DB_PATH):
-        self.db_path = db_path
-        self.conn = sqlite3.connect(str(db_path))
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA synchronous=NORMAL")
-        self.conn.executescript(NBA_SCHEMA_SQL)
-        self.conn.commit()
+    def __init__(self):
+        self.conn = get_connection()
         self.season = _get_current_season()
         self._import_nba_api()
 
@@ -389,6 +212,7 @@ class NBADataCollector:
 
             now = datetime.now(timezone.utc).isoformat()
             count = 0
+            cur = self.conn.cursor()
 
             for _, row in df.iterrows():
                 player_id = _safe_int(row.get("PLAYER_ID"))
@@ -398,7 +222,6 @@ class NBADataCollector:
                 gp = _safe_int(row.get("GP", 0))
                 mpg = _safe_float(row.get("MIN", 0))
 
-                # Skip players with minimal playing time
                 if gp < 5 or mpg < 10:
                     continue
 
@@ -406,37 +229,54 @@ class NBADataCollector:
                 reb = _safe_float(row.get("REB", 0))
                 ast = _safe_float(row.get("AST", 0))
 
-                # Per-minute rates
                 pts_per_min = pts / mpg if mpg > 0 else 0
                 reb_per_min = reb / mpg if mpg > 0 else 0
                 ast_per_min = ast / mpg if mpg > 0 else 0
 
                 team_abbr = str(row.get("TEAM_ABBREVIATION", ""))
 
-                self.conn.execute("""
-                    INSERT OR REPLACE INTO nba_players
+                cur.execute("""
+                    INSERT INTO nba_players
                     (player_id, player_name, team_abbr, season,
                      games_played, minutes_pg, points_pg, rebounds_pg, assists_pg,
                      steals_pg, blocks_pg, turnovers_pg,
                      fg_pct, fg3_pct, ft_pct, fga_pg, fta_pg, fg3a_pg,
                      plus_minus, pts_per_min, reb_per_min, ast_per_min,
                      updated_at)
-                    VALUES (?, ?, ?, ?,
-                            ?, ?, ?, ?, ?,
-                            ?, ?, ?,
-                            ?, ?, ?, ?, ?, ?,
-                            ?, ?, ?, ?,
-                            ?)
+                    VALUES (%s, %s, %s, %s,
+                            %s, %s, %s, %s, %s,
+                            %s, %s, %s,
+                            %s, %s, %s, %s, %s, %s,
+                            %s, %s, %s, %s,
+                            %s)
+                    ON CONFLICT (player_id, season) DO UPDATE SET
+                        player_name = EXCLUDED.player_name,
+                        team_abbr = EXCLUDED.team_abbr,
+                        games_played = EXCLUDED.games_played,
+                        minutes_pg = EXCLUDED.minutes_pg,
+                        points_pg = EXCLUDED.points_pg,
+                        rebounds_pg = EXCLUDED.rebounds_pg,
+                        assists_pg = EXCLUDED.assists_pg,
+                        steals_pg = EXCLUDED.steals_pg,
+                        blocks_pg = EXCLUDED.blocks_pg,
+                        turnovers_pg = EXCLUDED.turnovers_pg,
+                        fg_pct = EXCLUDED.fg_pct,
+                        fg3_pct = EXCLUDED.fg3_pct,
+                        ft_pct = EXCLUDED.ft_pct,
+                        fga_pg = EXCLUDED.fga_pg,
+                        fta_pg = EXCLUDED.fta_pg,
+                        fg3a_pg = EXCLUDED.fg3a_pg,
+                        plus_minus = EXCLUDED.plus_minus,
+                        pts_per_min = EXCLUDED.pts_per_min,
+                        reb_per_min = EXCLUDED.reb_per_min,
+                        ast_per_min = EXCLUDED.ast_per_min,
+                        updated_at = EXCLUDED.updated_at
                 """, (
                     player_id,
                     str(row.get("PLAYER_NAME", "")),
                     team_abbr,
                     self.season,
-                    gp,
-                    mpg,
-                    pts,
-                    reb,
-                    ast,
+                    gp, mpg, pts, reb, ast,
                     _safe_float(row.get("STL", 0)),
                     _safe_float(row.get("BLK", 0)),
                     _safe_float(row.get("TOV", 0)),
@@ -494,26 +334,26 @@ class NBADataCollector:
 
             now = datetime.now(timezone.utc).isoformat()
 
-            # Last-5 game averages (higher recency weight in model v2)
             recent5 = df.head(5)
             r5_pts = [_safe_float(r) for r in recent5["PTS"].values] if len(df) >= 5 else pts_vals
             r5_reb = [_safe_float(r) for r in recent5["REB"].values] if len(df) >= 5 else reb_vals
             r5_ast = [_safe_float(r) for r in recent5["AST"].values] if len(df) >= 5 else ast_vals
 
-            self.conn.execute("""
+            cur = self.conn.cursor()
+            cur.execute("""
                 UPDATE nba_players SET
-                    recent_pts_avg = ?,
-                    recent_reb_avg = ?,
-                    recent_ast_avg = ?,
-                    recent_min_avg = ?,
-                    recent_pts_std = ?,
-                    recent_reb_std = ?,
-                    recent_ast_std = ?,
-                    recent5_pts_avg = ?,
-                    recent5_reb_avg = ?,
-                    recent5_ast_avg = ?,
-                    updated_at = ?
-                WHERE player_id = ? AND season = ?
+                    recent_pts_avg = %s,
+                    recent_reb_avg = %s,
+                    recent_ast_avg = %s,
+                    recent_min_avg = %s,
+                    recent_pts_std = %s,
+                    recent_reb_std = %s,
+                    recent_ast_std = %s,
+                    recent5_pts_avg = %s,
+                    recent5_reb_avg = %s,
+                    recent5_ast_avg = %s,
+                    updated_at = %s
+                WHERE player_id = %s AND season = %s
             """, (
                 round(float(np.mean(pts_vals)), 2),
                 round(float(np.mean(reb_vals)), 2),
@@ -531,7 +371,6 @@ class NBADataCollector:
             ))
             self.conn.commit()
 
-            # Also collect home/away splits from game log
             self._update_home_away_splits(player_id, df)
 
             return True
@@ -555,13 +394,14 @@ class NBADataCollector:
             home_ast = float(home_games["AST"].mean()) if len(home_games) > 0 else 0
             away_ast = float(away_games["AST"].mean()) if len(away_games) > 0 else 0
 
-            self.conn.execute("""
+            cur = self.conn.cursor()
+            cur.execute("""
                 UPDATE nba_players SET
-                    home_pts_avg = ?, away_pts_avg = ?,
-                    home_reb_avg = ?, away_reb_avg = ?,
-                    home_ast_avg = ?, away_ast_avg = ?,
-                    updated_at = ?
-                WHERE player_id = ? AND season = ?
+                    home_pts_avg = %s, away_pts_avg = %s,
+                    home_reb_avg = %s, away_reb_avg = %s,
+                    home_ast_avg = %s, away_ast_avg = %s,
+                    updated_at = %s
+                WHERE player_id = %s AND season = %s
             """, (
                 round(home_pts, 2), round(away_pts, 2),
                 round(home_reb, 2), round(away_reb, 2),
@@ -577,12 +417,14 @@ class NBADataCollector:
         Collect recent form for top N players (by minutes played).
         Rate-limited: ~1 request per second.
         """
-        players = self.conn.execute("""
+        cur = self.conn.cursor()
+        cur.execute("""
             SELECT player_id, player_name FROM nba_players
-            WHERE season = ? AND games_played >= 10
+            WHERE season = %s AND games_played >= 10
             ORDER BY minutes_pg * games_played DESC
-            LIMIT ?
-        """, (self.season, top_n)).fetchall()
+            LIMIT %s
+        """, (self.season, top_n))
+        players = cur.fetchall()
 
         count = 0
         total = len(players)
@@ -610,7 +452,6 @@ class NBADataCollector:
         logger.info(f"[NBACollector] Collecting team stats for {self.season}...")
 
         try:
-            # Overall team stats
             stats = self._endpoints["team_stats"].LeagueDashTeamStats(
                 season=self.season,
                 per_mode_detailed="PerGame",
@@ -626,6 +467,7 @@ class NBADataCollector:
 
             now = datetime.now(timezone.utc).isoformat()
             count = 0
+            cur = self.conn.cursor()
 
             for _, row in df.iterrows():
                 team_id = _safe_int(row.get("TEAM_ID"))
@@ -634,16 +476,27 @@ class NBADataCollector:
 
                 team_abbr = str(row.get("TEAM_ABBREVIATION", ""))
 
-                self.conn.execute("""
-                    INSERT OR REPLACE INTO nba_teams
+                cur.execute("""
+                    INSERT INTO nba_teams
                     (team_id, team_abbr, team_name, season,
                      opp_pts_pg, opp_reb_pg, opp_ast_pg,
                      opp_fg_pct, opp_fg3_pct, def_rating, pace,
                      updated_at)
-                    VALUES (?, ?, ?, ?,
-                            ?, ?, ?,
-                            ?, ?, ?, ?,
-                            ?)
+                    VALUES (%s, %s, %s, %s,
+                            %s, %s, %s,
+                            %s, %s, %s, %s,
+                            %s)
+                    ON CONFLICT (team_id, season) DO UPDATE SET
+                        team_abbr = EXCLUDED.team_abbr,
+                        team_name = EXCLUDED.team_name,
+                        opp_pts_pg = EXCLUDED.opp_pts_pg,
+                        opp_reb_pg = EXCLUDED.opp_reb_pg,
+                        opp_ast_pg = EXCLUDED.opp_ast_pg,
+                        opp_fg_pct = EXCLUDED.opp_fg_pct,
+                        opp_fg3_pct = EXCLUDED.opp_fg3_pct,
+                        def_rating = EXCLUDED.def_rating,
+                        pace = EXCLUDED.pace,
+                        updated_at = EXCLUDED.updated_at
                 """, (
                     team_id,
                     team_abbr,
@@ -663,7 +516,6 @@ class NBADataCollector:
             self.conn.commit()
             logger.info(f"[NBACollector] Collected stats for {count} teams")
 
-            # Collect opponent stats by position
             self._collect_opponent_position_stats()
 
             return count
@@ -679,7 +531,6 @@ class NBADataCollector:
         Uses league dashboard with opponent splits.
         """
         try:
-            # Use player tracking defense endpoint
             defense = self._endpoints["defense"].LeagueDashPtDefend(
                 season=self.season,
                 defense_category="Overall",
@@ -692,27 +543,23 @@ class NBADataCollector:
             if df.empty:
                 return
 
-            # Aggregate by team + position for opponent allowed stats
-            # This gives us what positions score against each team
             now = datetime.now(timezone.utc).isoformat()
+            cur = self.conn.cursor()
 
-            # Group by team, calculate average opponent scoring by position
-            # Note: This is approximate — exact position tracking needs more endpoints
             for _, row in df.iterrows():
                 team_id = _safe_int(row.get("TEAM_ID"))
                 if not team_id:
                     continue
 
-                # Update team with defensive metrics if available
                 freq = _safe_float(row.get("FREQ", 0))
                 dfg = _safe_float(row.get("D_FG_PCT", 0))
 
                 if freq > 0:
-                    self.conn.execute("""
+                    cur.execute("""
                         UPDATE nba_teams SET
-                            recent_def_rating = ?,
-                            updated_at = ?
-                        WHERE team_id = ? AND season = ?
+                            recent_def_rating = %s,
+                            updated_at = %s
+                        WHERE team_id = %s AND season = %s
                     """, (dfg, now, team_id, self.season))
 
             self.conn.commit()
@@ -736,40 +583,19 @@ class NBADataCollector:
         logger.info("[NBACollector] Collecting injury report...")
 
         try:
-            # Clear old injuries first
-            self.conn.execute("DELETE FROM nba_injuries")
-
-            # Use scoreboard to get today's injury info
-            from nba_api.stats.endpoints import playerdashboardbygeneralsplits
-            # NBA doesn't have a clean injury API — we use the league injury endpoint
-            # or fall back to scraping
+            cur = self.conn.cursor()
+            cur.execute("DELETE FROM nba_injuries")
 
             try:
                 from nba_api.live.nba.endpoints import scoreboard
                 board = scoreboard.ScoreBoard()
                 games = board.get_dict()
-                # Extract injury info from game data if available
             except Exception:
                 pass
 
-            # Fallback: use common approach via requests
             now = datetime.now(timezone.utc).isoformat()
             count = 0
 
-            try:
-                import requests
-                url = "https://cdn.nba.com/static/json/liveData/odds/odds_todaysGames.json"
-                resp = requests.get(url, timeout=10, headers={
-                    "User-Agent": "Mozilla/5.0",
-                    "Referer": "https://www.nba.com/",
-                })
-                if resp.status_code == 200:
-                    # Parse injury data if available in the response
-                    pass
-            except Exception:
-                pass
-
-            # Also try the official injury report
             try:
                 import requests
                 url = "https://official.nba.com/wp-json/api/v1/injury-report"
@@ -785,11 +611,11 @@ class NBADataCollector:
                         reason = item.get("reason", item.get("Reason", ""))
 
                         if player_name:
-                            # Try to find player_id
-                            match = self.conn.execute(
-                                "SELECT player_id FROM nba_players WHERE player_name = ? AND season = ?",
+                            cur.execute(
+                                "SELECT player_id FROM nba_players WHERE player_name = %s AND season = %s",
                                 (player_name, self.season)
-                            ).fetchone()
+                            )
+                            match = cur.fetchone()
                             pid = match[0] if match else 0
 
                             team_abbr = ""
@@ -798,10 +624,16 @@ class NBADataCollector:
                                     team_abbr = abbr
                                     break
 
-                            self.conn.execute("""
-                                INSERT OR REPLACE INTO nba_injuries
+                            cur.execute("""
+                                INSERT INTO nba_injuries
                                 (player_id, player_name, team_abbr, status, injury_detail, updated_at)
-                                VALUES (?, ?, ?, ?, ?, ?)
+                                VALUES (%s, %s, %s, %s, %s, %s)
+                                ON CONFLICT (player_id) DO UPDATE SET
+                                    player_name = EXCLUDED.player_name,
+                                    team_abbr = EXCLUDED.team_abbr,
+                                    status = EXCLUDED.status,
+                                    injury_detail = EXCLUDED.injury_detail,
+                                    updated_at = EXCLUDED.updated_at
                             """, (pid, player_name, team_abbr, status, reason, now))
                             count += 1
             except Exception as e:
@@ -829,6 +661,7 @@ class NBADataCollector:
         logger.info("[NBACollector] Collecting schedule...")
         count = 0
         now = datetime.now(timezone.utc).isoformat()
+        cur = self.conn.cursor()
 
         try:
             today = date.today()
@@ -854,11 +687,18 @@ class NBADataCollector:
                         home_id = _safe_int(row.get("HOME_TEAM_ID"))
                         away_id = _safe_int(row.get("VISITOR_TEAM_ID"))
 
-                        self.conn.execute("""
-                            INSERT OR REPLACE INTO nba_games
+                        cur.execute("""
+                            INSERT INTO nba_games
                             (game_id, game_date, home_team_id, away_team_id,
                              home_team_abbr, away_team_abbr, status, updated_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (game_id) DO UPDATE SET
+                                home_team_id = EXCLUDED.home_team_id,
+                                away_team_id = EXCLUDED.away_team_id,
+                                home_team_abbr = EXCLUDED.home_team_abbr,
+                                away_team_abbr = EXCLUDED.away_team_abbr,
+                                status = EXCLUDED.status,
+                                updated_at = EXCLUDED.updated_at
                         """, (
                             game_id,
                             game_date.isoformat(),
@@ -874,7 +714,6 @@ class NBADataCollector:
                 except Exception as e:
                     logger.debug(f"[NBACollector] Schedule error for {date_str}: {e}")
 
-            # Detect back-to-back
             self._detect_back_to_backs()
 
             self.conn.commit()
@@ -887,20 +726,24 @@ class NBADataCollector:
 
     def _detect_back_to_backs(self) -> None:
         """Mark games where a team played the previous day."""
-        games = self.conn.execute("""
+        cur = self.conn.cursor()
+        cur.execute("""
             SELECT game_id, game_date, home_team_id, away_team_id
             FROM nba_games ORDER BY game_date
-        """).fetchall()
+        """)
+        games = cur.fetchall()
 
         team_last_game: Dict[int, str] = {}
         for game_id, game_date, home_id, away_id in games:
             home_b2b = 0
             away_b2b = 0
 
+            game_date_str = game_date if isinstance(game_date, str) else game_date.isoformat()
+
             if home_id in team_last_game:
                 try:
                     last = date.fromisoformat(team_last_game[home_id])
-                    curr = date.fromisoformat(game_date)
+                    curr = date.fromisoformat(game_date_str[:10])
                     if (curr - last).days == 1:
                         home_b2b = 1
                 except Exception:
@@ -909,21 +752,21 @@ class NBADataCollector:
             if away_id in team_last_game:
                 try:
                     last = date.fromisoformat(team_last_game[away_id])
-                    curr = date.fromisoformat(game_date)
+                    curr = date.fromisoformat(game_date_str[:10])
                     if (curr - last).days == 1:
                         away_b2b = 1
                 except Exception:
                     pass
 
-            self.conn.execute("""
+            cur.execute("""
                 UPDATE nba_games SET
-                    is_back_to_back_home = ?,
-                    is_back_to_back_away = ?
-                WHERE game_id = ?
+                    is_back_to_back_home = %s,
+                    is_back_to_back_away = %s
+                WHERE game_id = %s
             """, (home_b2b, away_b2b, game_id))
 
-            team_last_game[home_id] = game_date
-            team_last_game[away_id] = game_date
+            team_last_game[home_id] = game_date_str[:10]
+            team_last_game[away_id] = game_date_str[:10]
 
     # ----------------------------------------------------------------
     # Lookup Helpers
@@ -931,68 +774,60 @@ class NBADataCollector:
 
     def find_player(self, name: str) -> Optional[dict]:
         """Find a player by name (fuzzy match)."""
-        # Exact match first
-        row = self.conn.execute(
-            "SELECT * FROM nba_players WHERE player_name = ? AND season = ?",
+        cur = self.conn.cursor(cursor_factory=RealDictCursor)
+
+        cur.execute(
+            "SELECT * FROM nba_players WHERE player_name = %s AND season = %s",
             (name, self.season)
-        ).fetchone()
-
+        )
+        row = cur.fetchone()
         if row:
-            cols = [d[0] for d in self.conn.execute(
-                "SELECT * FROM nba_players LIMIT 0"
-            ).description]
-            return dict(zip(cols, row))
+            return dict(row)
 
-        # Fuzzy: LIKE match
-        row = self.conn.execute(
-            "SELECT * FROM nba_players WHERE player_name LIKE ? AND season = ? LIMIT 1",
+        cur.execute(
+            "SELECT * FROM nba_players WHERE player_name ILIKE %s AND season = %s LIMIT 1",
             (f"%{name}%", self.season)
-        ).fetchone()
-
+        )
+        row = cur.fetchone()
         if row:
-            cols = [d[0] for d in self.conn.execute(
-                "SELECT * FROM nba_players LIMIT 0"
-            ).description]
-            return dict(zip(cols, row))
+            return dict(row)
 
         return None
 
     def find_team(self, team_input: str) -> Optional[dict]:
         """Find a team by abbreviation or name."""
+        cur = self.conn.cursor(cursor_factory=RealDictCursor)
         abbr = team_input.upper()
+
         if len(abbr) <= 3:
-            row = self.conn.execute(
-                "SELECT * FROM nba_teams WHERE team_abbr = ? AND season = ?",
+            cur.execute(
+                "SELECT * FROM nba_teams WHERE team_abbr = %s AND season = %s",
                 (abbr, self.season)
-            ).fetchone()
+            )
         else:
-            # Try name lookup
             lookup = TEAM_NAME_TO_ABBR.get(team_input.lower(), "")
             if lookup:
-                row = self.conn.execute(
-                    "SELECT * FROM nba_teams WHERE team_abbr = ? AND season = ?",
+                cur.execute(
+                    "SELECT * FROM nba_teams WHERE team_abbr = %s AND season = %s",
                     (lookup, self.season)
-                ).fetchone()
+                )
             else:
-                row = self.conn.execute(
-                    "SELECT * FROM nba_teams WHERE team_name LIKE ? AND season = ?",
+                cur.execute(
+                    "SELECT * FROM nba_teams WHERE team_name ILIKE %s AND season = %s",
                     (f"%{team_input}%", self.season)
-                ).fetchone()
+                )
 
-        if row:
-            cols = [d[0] for d in self.conn.execute(
-                "SELECT * FROM nba_teams LIMIT 0"
-            ).description]
-            return dict(zip(cols, row))
-
-        return None
+        row = cur.fetchone()
+        return dict(row) if row else None
 
     def get_player_injury_status(self, player_name: str) -> Optional[str]:
         """Check if a player is on the injury report. Returns status or None."""
-        row = self.conn.execute(
-            "SELECT status, injury_detail FROM nba_injuries WHERE player_name LIKE ?",
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT status, injury_detail FROM nba_injuries WHERE player_name ILIKE %s",
             (f"%{player_name}%",)
-        ).fetchone()
+        )
+        row = cur.fetchone()
         return f"{row[0]} ({row[1]})" if row else None
 
     def is_back_to_back(self, team_abbr: str, game_date: str = None) -> bool:
@@ -1000,12 +835,14 @@ class NBADataCollector:
         if game_date is None:
             game_date = date.today().isoformat()
 
-        row = self.conn.execute("""
+        cur = self.conn.cursor()
+        cur.execute("""
             SELECT is_back_to_back_home, is_back_to_back_away,
                    home_team_abbr, away_team_abbr
             FROM nba_games
-            WHERE game_date = ? AND (home_team_abbr = ? OR away_team_abbr = ?)
-        """, (game_date, team_abbr, team_abbr)).fetchone()
+            WHERE game_date = %s AND (home_team_abbr = %s OR away_team_abbr = %s)
+        """, (game_date, team_abbr, team_abbr))
+        row = cur.fetchone()
 
         if not row:
             return False
@@ -1034,19 +871,10 @@ class NBADataCollector:
             "games": 0,
         }
 
-        # 1. All player season stats
         summary["players"] = self.collect_all_player_stats()
-
-        # 2. Team stats
         summary["teams"] = self.collect_all_team_stats()
-
-        # 3. Recent form for top players
         summary["recent_form"] = self.collect_all_recent_form(top_n=150)
-
-        # 4. Injuries
         summary["injuries"] = self.collect_injuries()
-
-        # 5. Schedule
         summary["games"] = self.collect_schedule(days_ahead=3)
 
         logger.info(f"[NBACollector] Full collection complete: {json.dumps(summary, indent=2)}")
@@ -1073,7 +901,8 @@ class NBADataCollector:
         return summary
 
     def close(self):
-        self.conn.close()
+        put_connection(self.conn)
+        self.conn = None
 
 
 # ============================================================================

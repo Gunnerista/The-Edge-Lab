@@ -16,7 +16,6 @@ Usage:
 import sys
 import json
 import math
-import sqlite3
 import logging
 import re
 import time
@@ -26,11 +25,11 @@ from collections import defaultdict
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from db import get_connection, put_connection
+
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-MARKET_DB = PROJECT_ROOT / "data" / "market_data.db"
-NBA_DB = PROJECT_ROOT / "data" / "nba_data.db"
 GAMELOG_CACHE = PROJECT_ROOT / "data" / "gamelogs_cache.json"
 REPORT_FILE = PROJECT_ROOT / "data" / "backtest_platt_report.json"
 
@@ -208,18 +207,19 @@ def main():
     logger.info(f"[Platt] Loaded {len(all_logs)} player game logs")
 
     # --- Resolve players ---
-    conn_nba = sqlite3.connect(str(NBA_DB))
-    conn_nba.row_factory = sqlite3.Row
-    conn_market = sqlite3.connect(str(MARKET_DB))
+    conn = get_connection(dict_cursor=True)
+    cur = conn.cursor()
 
-    rows = conn_market.execute("""
+    cur.execute("""
         SELECT DISTINCT ticker FROM settled_markets
         WHERE (ticker LIKE 'KXNBAPTS%' OR ticker LIKE 'KXNBAREB%' OR ticker LIKE 'KXNBAAST%')
         AND close_time >= '2026-01-01'
-    """).fetchall()
+    """)
+    rows = cur.fetchall()
 
     segments = set()
-    for (t,) in rows:
+    for row in rows:
+        t = row["ticker"]
         parts = t.split("-")
         if len(parts) >= 3: segments.add(parts[2])
 
@@ -228,21 +228,20 @@ def main():
         m = re.match(r'([A-Z]{3})([A-Z])([A-Z]+?)(\d*)$', seg.upper())
         if not m: continue
         last_name = m.group(3).capitalize()
-        row = conn_nba.execute(
-            "SELECT player_id FROM nba_players WHERE player_name LIKE ? AND season='2025-26' AND games_played>=5 LIMIT 1",
+        cur.execute(
+            "SELECT player_id FROM nba_players WHERE player_name LIKE %s AND season='2025-26' AND games_played>=5 LIMIT 1",
             (f"% {last_name}%",)
-        ).fetchone()
+        )
+        row = cur.fetchone()
         if row:
             seg_to_pid[seg] = str(row["player_id"])
 
     # Load teams
-    team_rows = conn_nba.execute("SELECT * FROM nba_teams WHERE season='2025-26'").fetchall()
-    teams = {r["team_abbr"]: dict(r) for r in team_rows}
-    conn_nba.close()
+    cur.execute("SELECT * FROM nba_teams WHERE season='2025-26'")
+    teams = {r["team_abbr"]: dict(r) for r in cur.fetchall()}
 
     # --- Load markets ---
-    conn_market.row_factory = sqlite3.Row
-    markets = conn_market.execute("""
+    cur.execute("""
         SELECT s.ticker, s.result, s.close_time,
                p.yes_price as kalshi_price
         FROM settled_markets s
@@ -254,9 +253,9 @@ def main():
         WHERE (s.ticker LIKE 'KXNBAPTS%' OR s.ticker LIKE 'KXNBAREB%' OR s.ticker LIKE 'KXNBAAST%')
         AND s.close_time >= '2026-01-01'
         ORDER BY s.close_time
-    """).fetchall()
-    conn_market.close()
-    markets = [dict(r) for r in markets]
+    """)
+    markets = [dict(r) for r in cur.fetchall()]
+    put_connection(conn)
 
     logger.info(f"[Platt] {len(markets)} markets loaded")
 

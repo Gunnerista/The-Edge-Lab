@@ -123,6 +123,46 @@ class KellyCriterion:
             return -100 / (decimal_odds - 1)
 
 
+def kelly_bet_size(edge, odds, bankroll, kelly_fraction=0.25):
+    """
+    Fractional Kelly Criterion for Kalshi binary markets.
+
+    Parameters:
+        edge: calculated edge (0.20 = 20% edge)
+        odds: payout ratio.
+              YES bet: (1 - entry_price) / entry_price
+              NO bet:  entry_price / (1 - entry_price)
+        bankroll: current virtual bankroll ($)
+        kelly_fraction: Kelly fraction (0.25 = quarter Kelly)
+
+    Returns:
+        bet_size in dollars
+    """
+    b = odds
+    if b <= 0:
+        return 0
+
+    p = edge + (1 / (1 + b))
+    q = 1 - p
+
+    kelly_full = (b * p - q) / b
+
+    if kelly_full <= 0:
+        return 0
+
+    kelly_adjusted = kelly_full * kelly_fraction
+
+    max_bet_pct = 0.05
+    bet_pct = min(kelly_adjusted, max_bet_pct)
+
+    bet_size = bankroll * bet_pct
+
+    min_bet = 1.0
+    max_bet = 25.0
+
+    return max(min_bet, min(bet_size, max_bet))
+
+
 class BankrollTracker:
     """
     Main bankroll management and tracking system.

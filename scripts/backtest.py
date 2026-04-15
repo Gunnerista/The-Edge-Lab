@@ -20,7 +20,6 @@ Usage:
 
 import sys
 import json
-import sqlite3
 import logging
 import argparse
 import time
@@ -32,38 +31,40 @@ from dataclasses import asdict
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from nba_model import NBAModel
+from db import get_connection, put_connection
 
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-MARKET_DB = PROJECT_ROOT / "data" / "market_data.db"
 REPORT_FILE = PROJECT_ROOT / "data" / "backtest_report.json"
 
 
-def load_settled_markets(db_path: Path, limit: int = 0) -> list[dict]:
+def load_settled_markets(limit: int = 0) -> list[dict]:
     """Load all settled NBA prop markets with optional price data."""
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
+    conn = get_connection(dict_cursor=True)
 
     limit_clause = f"LIMIT {limit}" if limit else ""
 
-    rows = conn.execute(f"""
-        SELECT s.ticker, s.title, s.result, s.close_time,
-               p.yes_price as kalshi_price
-        FROM settled_markets s
-        LEFT JOIN (
-            SELECT ticker, yes_price,
-                   ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY id DESC) as rn
-            FROM price_snapshots
-        ) p ON s.ticker = p.ticker AND p.rn = 1
-        WHERE s.ticker LIKE 'KXNBAPTS%'
-           OR s.ticker LIKE 'KXNBAREB%'
-           OR s.ticker LIKE 'KXNBAAST%'
-        ORDER BY s.close_time DESC
-        {limit_clause}
-    """).fetchall()
-
-    conn.close()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"""
+            SELECT s.ticker, s.title, s.result, s.close_time,
+                   p.yes_price as kalshi_price
+            FROM settled_markets s
+            LEFT JOIN (
+                SELECT ticker, yes_price,
+                       ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY id DESC) as rn
+                FROM price_snapshots
+            ) p ON s.ticker = p.ticker AND p.rn = 1
+            WHERE s.ticker LIKE 'KXNBAPTS%'
+               OR s.ticker LIKE 'KXNBAREB%'
+               OR s.ticker LIKE 'KXNBAAST%'
+            ORDER BY s.close_time DESC
+            {limit_clause}
+        """)
+        rows = cur.fetchall()
+    finally:
+        put_connection(conn)
     return [dict(r) for r in rows]
 
 
@@ -74,7 +75,7 @@ def run_backtest(limit: int = 0):
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    markets = load_settled_markets(MARKET_DB, limit)
+    markets = load_settled_markets(limit)
     logger.info(f"[Backtest] Loaded {len(markets)} settled markets")
 
     model = NBAModel()

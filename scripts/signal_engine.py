@@ -54,6 +54,64 @@ from db import get_connection, put_connection
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# prediction_log.jsonl writer (scanner path)
+# ---------------------------------------------------------------------------
+# forward_test.py writes prediction_log on its 12pm cron batch. The scanner
+# (auto_trader -> signal_engine.detect_nba_prop_signals) runs a DIFFERENT path
+# and historically never touched prediction_log. On 2026-04-07 the 12pm cron
+# did not fire for that day, so scanner-triggered Vucevic trades existed in
+# trade_log.jsonl with no matching prediction_log entries. This writer closes
+# that gap: every NBA prop signal emitted by the scanner is also appended to
+# prediction_log.jsonl, using a schema compatible with settle_predictions.py.
+PRED_LOG_FILE = Path(__file__).resolve().parent.parent / "data" / "prediction_log.jsonl"
+
+try:
+    from forward_test import CONFIG_VERSION as _FT_CONFIG_VERSION
+except Exception:
+    _FT_CONFIG_VERSION = "untagged"
+
+
+def _load_logged_tickers_today() -> set:
+    """Return set of tickers already in prediction_log.jsonl for today (ET)."""
+    try:
+        from tz import ET
+        today_iso = datetime.now(ET).date().isoformat()
+    except Exception:
+        today_iso = datetime.now(timezone.utc).date().isoformat()
+    seen = set()
+    if not PRED_LOG_FILE.exists():
+        return seen
+    try:
+        with open(PRED_LOG_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                if today_iso not in line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                pt = r.get("prediction_time", "")
+                if pt.startswith(today_iso) and r.get("ticker"):
+                    seen.add(r["ticker"])
+    except Exception as e:
+        logger.warning(f"[PredLog] Could not scan existing prediction_log: {e}")
+    return seen
+
+
+def _append_prediction_log(entry: dict) -> None:
+    """Append a single prediction entry to prediction_log.jsonl.
+
+    Raises no exceptions — logs warnings on failure instead (silent failures
+    are worse than loud ones, but we must not kill the scan cycle).
+    """
+    try:
+        PRED_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(PRED_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.warning(f"[PredLog] Append failed for {entry.get('ticker','?')}: {e}")
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # ============================================================================
@@ -152,7 +210,7 @@ class SignalEngine:
     # Minimum thresholds
     MIN_EDGE = 0.20             # default (used by non-NBA detectors)
     PROP_MIN_EDGE = {           # per-prop-type edge thresholds for NBA prop detector
-        "assists": None,        # disabled (43.8% win rate, -27.8% ROI)
+        "assists": 0.25,        # re-enabled v5_kelly (was disabled in v4)
         "points":  0.25,
         "rebounds": 0.20,       # relaxed 0.25→0.20 (profitable prop)
         "threes":  0.25,
@@ -724,8 +782,7 @@ class SignalEngine:
         NBA_PREFIXES = ["KXNBAPTS", "KXNBAREB", "KXNBAAST", "KXNBA3PT", "KXNBASTL", "KXNBABLK"]
         dates = [today, today + timedelta(days=1)]
 
-        def _date_to_pattern(d: _date) -> str:
-            return f"{str(d.year)[-2:]}{d.strftime('%b').upper()}{d.day}"
+        from tz import ticker_date_pattern as _date_to_pattern
 
         nba_markets_dict = {}
         cur = self.conn.cursor()
@@ -758,6 +815,11 @@ class SignalEngine:
         except Exception as e:
             logger.error(f"[SignalEngine] Failed to initialize NBA model: {e}")
             return []
+
+        # prediction_log dedupe: skip tickers already logged today (forward_test
+        # batch or earlier scan cycle). Loaded once per scan call.
+        logged_today = _load_logged_tickers_today()
+        scan_prediction_time = datetime.now(timezone.utc).isoformat()
 
         for mkt in nba_markets:
             ticker = mkt["ticker"]
@@ -861,6 +923,54 @@ class SignalEngine:
                     "data_quality": prediction.data_quality,
                 },
             ))
+
+            # --- prediction_log mirror (scanner path) -----------------------
+            # Emit one prediction_log entry per unique (ticker, day) so that
+            # settle_predictions.py can later attach actual results. Schema is
+            # intentionally compatible with forward_test.py's writer.
+            if ticker not in logged_today:
+                # game date + matchup from ticker (e.g. KXNBAREB-26APR07CHABOS-...)
+                game_date_iso = None
+                _mu = None
+                try:
+                    _parts = ticker.split("-")
+                    if len(_parts) > 1 and len(_parts[1]) >= 13:
+                        _datetok = _parts[1][:7]  # "26APR07"
+                        _mu = _parts[1][7:13]     # "CHABOS"
+                        _months = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
+                                   "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
+                        _yy = int(_datetok[:2]) + 2000
+                        _mm = _months.get(_datetok[2:5])
+                        _dd = int(_datetok[5:7])
+                        if _mm:
+                            game_date_iso = f"{_yy:04d}-{_mm:02d}-{_dd:02d}"
+                except Exception:
+                    pass
+                log_entry = {
+                    "ticker": ticker,
+                    "player": prediction.player_name,
+                    "prop_type": prediction.prop_type,
+                    "line": prediction.line,
+                    "projected_value": prediction.projected_value,
+                    "model_prob": round(model_prob_yes, 4),
+                    "kalshi_price": round(mid_price, 4),
+                    "edge": round(model_prob_yes - mid_price, 4),
+                    "confidence": confidence,
+                    "game_date": game_date_iso,
+                    "matchup": _mu,
+                    "pre_game_spread": None,
+                    "prediction_time": scan_prediction_time,
+                    "source": "scanner",
+                    "reasoning": prediction.reasoning,
+                    "actual_result": None,
+                    "settled": False,
+                    "config_version": _FT_CONFIG_VERSION or "untagged",
+                    "scanner_side": side,
+                    "scanner_entry_price": round(entry, 4),
+                    "scanner_ev_cents": round(ev * 100, 2),
+                }
+                _append_prediction_log(log_entry)
+                logged_today.add(ticker)
 
         model.close()
         logger.info(f"[SignalEngine] NBA prop model: {len(signals)} signals")

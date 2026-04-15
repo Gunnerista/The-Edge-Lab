@@ -1,0 +1,55 @@
+system:
+  name: "war-machine-mlb"
+  mode: "paper"  # paper | live
+  force_dry_run: true
+
+database:
+  host: "localhost"
+  port: 5432
+  name: "warmachine"
+  table_prefix: "mlb_"
+
+kalshi:
+  env: "prod"  # prod API, paper mode는 코드 레벨에서 제어
+
+model:
+  type: "xgboost"
+  calibration: "platt"
+
+trading:
+  global_min_edge: 0.15
+  max_spread_cents: 20  # MLB 유동성 낮으므로 NBA(10)보다 넓게 시작
+  kelly_fraction: 0.25
+  kelly_cap: 0.05
+  min_bet: 1.0
+  max_bet: 5.0
+  daily_max_loss: 10.0
+  max_open_positions: 10
+  yes_premium: 0.05
+
+props:
+  strikeouts:
+    enabled: true
+    min_edge: 0.20
+    prefix: "KXMLBKS"
+  hits:
+    enabled: false
+    min_edge: 0.25
+    prefix: "KXMLBHIT"
+  total_bases:
+    enabled: false
+    min_edge: 0.25
+    prefix: "KXMLBTB"
+  home_runs:
+    enabled: false
+    min_edge: 0.30
+    prefix: "KXMLBHR"
+  hrr:
+    enabled: false
+    min_edge: 0.25
+    prefix: "KXMLBHRR"
+
+schedule:
+  check_interval_minutes: 30
+  pre_game_hours: 2
+  post_game_buffer_hours: 1

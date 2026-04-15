@@ -72,28 +72,32 @@ except Exception:
     _FT_CONFIG_VERSION = "untagged"
 
 
-def _load_logged_tickers_today() -> set:
-    """Return set of tickers already in prediction_log.jsonl for today (ET)."""
-    try:
-        from tz import ET
-        today_iso = datetime.now(ET).date().isoformat()
-    except Exception:
-        today_iso = datetime.now(timezone.utc).date().isoformat()
+def _load_recently_logged_scanner_tickers(window_seconds: int = 600) -> set:
+    """Return set of scanner-source tickers logged within the last window_seconds (UTC)."""
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=window_seconds)
     seen = set()
     if not PRED_LOG_FILE.exists():
         return seen
     try:
         with open(PRED_LOG_FILE, "r", encoding="utf-8") as f:
             for line in f:
-                if today_iso not in line:
-                    continue
                 try:
                     r = json.loads(line)
                 except Exception:
                     continue
-                pt = r.get("prediction_time", "")
-                if pt.startswith(today_iso) and r.get("ticker"):
-                    seen.add(r["ticker"])
+                if r.get("source") != "scanner":
+                    continue
+                pt_str = r.get("prediction_time", "")
+                if not pt_str:
+                    continue
+                try:
+                    pt = datetime.fromisoformat(pt_str)
+                    if pt.tzinfo is None:
+                        pt = pt.replace(tzinfo=timezone.utc)
+                    if pt >= cutoff and r.get("ticker"):
+                        seen.add(r["ticker"])
+                except Exception:
+                    continue
     except Exception as e:
         logger.warning(f"[PredLog] Could not scan existing prediction_log: {e}")
     return seen
@@ -818,7 +822,7 @@ class SignalEngine:
 
         # prediction_log dedupe: skip tickers already logged today (forward_test
         # batch or earlier scan cycle). Loaded once per scan call.
-        logged_today = _load_logged_tickers_today()
+        logged_today = _load_recently_logged_scanner_tickers(window_seconds=600)
         scan_prediction_time = datetime.now(timezone.utc).isoformat()
 
         for mkt in nba_markets:
@@ -971,6 +975,8 @@ class SignalEngine:
                 }
                 _append_prediction_log(log_entry)
                 logged_today.add(ticker)
+            else:
+                logger.debug(f"[PredLog-Dedup] SKIP: {ticker}")
 
         model.close()
         logger.info(f"[SignalEngine] NBA prop model: {len(signals)} signals")

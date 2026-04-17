@@ -93,12 +93,17 @@ LEAGUE_AVG_OPP_REB = 44.0
 LEAGUE_AVG_OPP_AST = 26.0
 LEAGUE_AVG_PACE = 100.0
 
-# Platt scaling parameters (fitted on OOS train set, Jan-Feb 2026)
+# Platt scaling parameters — v2 refit on 2,308 samples (2026-03-28 to 2026-04-14)
 # Applies sigmoid recalibration: P_cal = sigmoid(PLATT_A * logit(P_raw) + PLATT_B)
-# Only used when edge > 20% where Platt outperforms raw (net ROI +4.5% vs +3.0%)
-PLATT_A = 0.8976
-PLATT_B = -0.4242
-PLATT_EDGE_THRESHOLD = 0.20  # only apply Platt when |edge| > 20%
+#
+# v2 vs v1: Applied ALWAYS (not gated by edge threshold).
+#   v1 (A=0.8976, B=-0.4242, edge>20% gate): ECE=0.0728 on 2308 samples
+#   v2 (A=0.6759, B=-0.3489, always apply):  ECE=0.0307 on same 2308 samples
+#
+# See docs/CALIBRATION_v2_2026-04-17.md for refit methodology and validation.
+PLATT_A = 0.6759
+PLATT_B = -0.3489
+PLATT_EDGE_THRESHOLD = 0.0  # apply ALWAYS — refit is well-calibrated across full range
 
 # Edge shrinkage: when model-vs-market divergence is large (≥20%),
 # the model is more likely wrong than the market. Shrink model_prob
@@ -185,20 +190,18 @@ class PropPrediction:
         """
         Returns the probability to use for trading decisions.
 
-        Pipeline:
-          1. If |edge| > 20%: use Platt-calibrated prob (reduces extreme predictions)
-          2. Then apply edge shrinkage: pull 5% toward market price
-             → Rationale: when model diverges heavily from market, there's
-               usually information the model doesn't have. Shrinking toward
-               market is a Bayesian hedge.
-        """
-        raw_edge = abs(self.model_prob - kalshi_price)
+        v2 Pipeline (2026-04-17 refit):
+          1. Always use Platt-calibrated prob (v2 constants fit on 2308 samples,
+             ECE=0.0307 across full probability range — no need for edge gate).
+          2. Apply edge shrinkage: pull 5% toward market when divergence ≥20%.
+             → Bayesian hedge: when model diverges heavily from market,
+               there's usually information the model doesn't have.
 
-        # Step 1: Select base probability
-        if raw_edge > PLATT_EDGE_THRESHOLD:
-            base_prob = self.platt_prob
-        else:
-            base_prob = self.model_prob
+        NOTE: self.platt_prob is already computed using v2 constants at
+        prediction time (see _project method line ~485). We use it directly.
+        """
+        # Step 1: Always use Platt (v2 constants are well-calibrated across range)
+        base_prob = self.platt_prob
 
         # Step 2: Edge shrinkage — pull toward market when divergence is large
         effective_edge = abs(base_prob - kalshi_price)

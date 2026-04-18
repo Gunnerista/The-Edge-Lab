@@ -533,7 +533,7 @@ class NBAModel:
         has_matchup = opp_team is not None
 
         # Immediate downgrades
-        if injury_status and any(s in injury_status.lower() for s in ["out", "doubtful"]):
+        if injury_status and any(s in injury_status.lower() for s in ["out", "doubtful", "day-to-day", "day to day", "questionable", "dtd"]):
             return "low"  # injured players = unreliable
 
         if gp >= HIGH_CONFIDENCE_MIN_GAMES and has_recent and has_matchup:

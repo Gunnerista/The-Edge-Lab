@@ -37,6 +37,8 @@ import json
 import logging
 import argparse
 import traceback
+import unicodedata
+import re
 from datetime import datetime, timezone, timedelta, date
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -52,6 +54,182 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # Rate limiting for NBA API (they throttle aggressively)
 API_DELAY = 0.8  # seconds between requests
+
+# ============================================================================
+# Injury fallback sources (ESPN JSON / HTML / cache)
+# ============================================================================
+
+ESPN_INJURY_JSON_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries"
+ESPN_INJURY_HTML_URL = "https://www.espn.com/nba/injuries"
+INJURY_CACHE_FILE = PROJECT_ROOT / "data" / "injury_cache.json"
+INJURY_CACHE_MAX_AGE_HOURS = 24
+HTTP_TIMEOUT_SEC = 5
+HTTP_RETRIES = 2
+
+
+def _normalize_player_name(name: str) -> str:
+    """Unicode NFKD fold to ASCII for cross-source matching.
+
+    'Nikola Vučević' → 'nikola vucevic'
+    "De'Aaron Fox"   → 'deaaron fox'
+    """
+    if not name:
+        return ""
+    nfkd = unicodedata.normalize("NFKD", name)
+    ascii_bytes = nfkd.encode("ascii", "ignore").decode("ascii")
+    # lowercase, remove apostrophes/periods, collapse whitespace
+    s = re.sub(r"[.'`]", "", ascii_bytes).lower().strip()
+    return re.sub(r"\s+", " ", s)
+
+
+def _normalize_injury_status(raw: str) -> str:
+    """Map various status strings to a small canonical set."""
+    if not raw:
+        return "Unknown"
+    s = raw.strip().lower()
+    if s in ("out", "out (g)", "o"):
+        return "Out"
+    if "day" in s or s in ("dtd", "d"):
+        return "Day-To-Day"
+    if "probable" in s or s == "p":
+        return "Probable"
+    if "question" in s or s in ("gtd", "q"):
+        return "Questionable"
+    if "doubt" in s:
+        return "Doubtful"
+    return raw.strip()[:50] or "Unknown"
+
+
+def _http_get_with_retry(url: str, headers: dict = None, timeout: int = HTTP_TIMEOUT_SEC,
+                         retries: int = HTTP_RETRIES):
+    """GET with retry. Returns requests.Response or None on all-failure."""
+    import requests
+    hdrs = headers or {"User-Agent": "Mozilla/5.0"}
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.get(url, headers=hdrs, timeout=timeout)
+            if r.status_code == 200:
+                return r
+            last_err = f"HTTP {r.status_code}"
+        except Exception as e:
+            last_err = str(e)
+        if attempt < retries:
+            time.sleep(0.5 * attempt)
+    logger.debug(f"[Injury] GET {url} failed after {retries} attempts: {last_err}")
+    return None
+
+
+def _fetch_espn_json_injuries() -> List[dict]:
+    """Fetch ESPN JSON injury API. Returns list of normalized entries."""
+    r = _http_get_with_retry(ESPN_INJURY_JSON_URL)
+    if not r:
+        return []
+    try:
+        data = r.json()
+    except Exception as e:
+        logger.debug(f"[Injury] ESPN JSON parse failed: {e}")
+        return []
+
+    out = []
+    for team_block in data.get("injuries", []):
+        team_name = team_block.get("displayName", "")
+        if not team_name:
+            team_obj = team_block.get("team", {})
+            team_name = team_obj.get("displayName", "") if isinstance(team_obj, dict) else ""
+        for p in team_block.get("injuries", []):
+            athlete = p.get("athlete", {})
+            pname = athlete.get("displayName", "") if isinstance(athlete, dict) else ""
+            if not pname:
+                continue
+            details = p.get("details") or {}
+            out.append({
+                "player_name": pname,
+                "team_name": team_name,
+                "status": _normalize_injury_status(p.get("status", "")),
+                "body_part": details.get("type", "") if isinstance(details, dict) else "",
+                "detail": details.get("detail", "") if isinstance(details, dict) else "",
+                "return_date": details.get("returnDate", "") if isinstance(details, dict) else "",
+            })
+    return out
+
+
+def _fetch_espn_html_injuries() -> List[dict]:
+    """Scrape ESPN injuries HTML page. Fallback for when JSON API fails."""
+    r = _http_get_with_retry(ESPN_INJURY_HTML_URL)
+    if not r:
+        return []
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        logger.debug("[Injury] bs4 not installed, HTML fallback unavailable")
+        return []
+
+    try:
+        soup = BeautifulSoup(r.text, "html.parser")
+    except Exception as e:
+        logger.debug(f"[Injury] ESPN HTML parse failed: {e}")
+        return []
+
+    out = []
+    # ESPN structures: each team has a section with a Table__Title + Table
+    for section in soup.select(".Table__Title, .ResponsiveTable"):
+        team_name_el = section.select_one(".injuries__teamName, .Table__Title")
+        team_name = team_name_el.get_text(strip=True) if team_name_el else ""
+        table = section.select_one("table") or section.find_next("table")
+        if not table:
+            continue
+        for row in table.select("tbody tr"):
+            cells = [td.get_text(strip=True) for td in row.find_all("td")]
+            if len(cells) < 4:
+                continue
+            pname = cells[0]
+            if not pname:
+                continue
+            out.append({
+                "player_name": pname,
+                "team_name": team_name,
+                "status": _normalize_injury_status(cells[3] if len(cells) > 3 else ""),
+                "body_part": "",
+                "detail": cells[4] if len(cells) > 4 else "",
+                "return_date": cells[2] if len(cells) > 2 else "",
+            })
+    return out
+
+
+def _load_injury_cache() -> Tuple[List[dict], float]:
+    """Load cached injuries. Returns (entries, age_hours). ([], inf) if missing/invalid."""
+    if not INJURY_CACHE_FILE.exists():
+        return [], float("inf")
+    try:
+        with open(INJURY_CACHE_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        ts_str = d.get("cached_at", "")
+        entries = d.get("entries", [])
+        ts = datetime.fromisoformat(ts_str) if ts_str else None
+        if ts is None:
+            return entries, float("inf")
+        age_h = (datetime.now(timezone.utc) - ts).total_seconds() / 3600
+        return entries, age_h
+    except Exception as e:
+        logger.debug(f"[Injury] Cache read failed: {e}")
+        return [], float("inf")
+
+
+def _save_injury_cache(entries: List[dict], source: str):
+    """Persist successful fetch to data/injury_cache.json."""
+    try:
+        INJURY_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "cached_at": datetime.now(timezone.utc).isoformat(),
+            "source": source,
+            "count": len(entries),
+            "entries": entries,
+        }
+        with open(INJURY_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"[Injury] Cache write failed: {e}")
 
 
 # ============================================================================
@@ -574,7 +752,11 @@ class NBADataCollector:
 
     def collect_injuries(self) -> int:
         """
-        Collect current NBA injury report.
+        Collect current NBA injury report with 3-tier fallback:
+          1. official.nba.com JSON API
+          2. ESPN: JSON API → HTML scrape
+          3. Last successful cache (if < 24h old)
+
         Returns number of injuries logged.
         """
         if not self._available:
@@ -582,70 +764,158 @@ class NBADataCollector:
 
         logger.info("[NBACollector] Collecting injury report...")
 
+        source = "none"
+        entries = []  # list of {player_name, team_name, status, body_part, detail, return_date}
+
+        # ----- Tier 1: Official NBA -----
+        try:
+            official = self._fetch_nba_official_injuries()
+            if official:
+                entries = official
+                source = "nba_official"
+                logger.info(f"[Injury] nba_official: {len(entries)} entries")
+        except Exception as e:
+            logger.debug(f"[Injury] nba_official failed: {e}")
+
+        # ----- Tier 2a: ESPN JSON -----
+        if not entries:
+            try:
+                espn_json = _fetch_espn_json_injuries()
+                if espn_json:
+                    entries = espn_json
+                    source = "espn_json"
+                    logger.info(f"[Injury] espn_json: {len(entries)} entries")
+            except Exception as e:
+                logger.debug(f"[Injury] espn_json failed: {e}")
+
+        # ----- Tier 2b: ESPN HTML -----
+        if not entries:
+            try:
+                espn_html = _fetch_espn_html_injuries()
+                if espn_html:
+                    entries = espn_html
+                    source = "espn_html"
+                    logger.info(f"[Injury] espn_html: {len(entries)} entries")
+            except Exception as e:
+                logger.debug(f"[Injury] espn_html failed: {e}")
+
+        # ----- Tier 3: Cache (24h) -----
+        if not entries:
+            cached, age_h = _load_injury_cache()
+            if cached and age_h <= INJURY_CACHE_MAX_AGE_HOURS:
+                entries = cached
+                source = "cache"
+                logger.warning(f"[Injury] Using cache ({age_h:.1f}h old, {len(entries)} entries)")
+            elif cached:
+                logger.warning(f"[Injury] Cache too stale ({age_h:.1f}h > {INJURY_CACHE_MAX_AGE_HOURS}h), ignoring")
+
+        if not entries:
+            logger.warning("[Injury] All sources failed (nba_official/espn_json/espn_html/cache)")
+            return 0
+
+        # ----- Write to DB -----
         try:
             cur = self.conn.cursor()
             cur.execute("DELETE FROM nba_injuries")
 
-            try:
-                from nba_api.live.nba.endpoints import scoreboard
-                board = scoreboard.ScoreBoard()
-                games = board.get_dict()
-            except Exception:
-                pass
-
             now = datetime.now(timezone.utc).isoformat()
             count = 0
+            synthetic_id = -1  # negative IDs for players not in nba_players
 
-            try:
-                import requests
-                url = "https://official.nba.com/wp-json/api/v1/injury-report"
-                resp = requests.get(url, timeout=10, headers={
-                    "User-Agent": "Mozilla/5.0",
-                })
-                if resp.status_code == 200:
-                    data = resp.json()
-                    for item in data if isinstance(data, list) else data.get("data", []):
-                        player_name = item.get("player", item.get("Player", ""))
-                        team = item.get("team", item.get("Team", ""))
-                        status = item.get("status", item.get("Current Status", ""))
-                        reason = item.get("reason", item.get("Reason", ""))
+            # Build ASCII-fold → player_id map from nba_players for robust matching
+            cur.execute("SELECT player_id, player_name FROM nba_players WHERE season = %s", (self.season,))
+            name_to_pid = {}
+            for pid, pname in cur.fetchall():
+                name_to_pid[_normalize_player_name(pname)] = pid
 
-                        if player_name:
-                            cur.execute(
-                                "SELECT player_id FROM nba_players WHERE player_name = %s AND season = %s",
-                                (player_name, self.season)
-                            )
-                            match = cur.fetchone()
-                            pid = match[0] if match else 0
+            for e in entries:
+                pname = e.get("player_name", "")
+                if not pname:
+                    continue
 
-                            team_abbr = ""
-                            for key, abbr in TEAM_NAME_TO_ABBR.items():
-                                if key in team.lower():
-                                    team_abbr = abbr
-                                    break
+                # Unicode-safe player_id lookup
+                normalized = _normalize_player_name(pname)
+                pid = name_to_pid.get(normalized)
+                if pid is None:
+                    pid = synthetic_id
+                    synthetic_id -= 1  # unique negative id for each unmatched
 
-                            cur.execute("""
-                                INSERT INTO nba_injuries
-                                (player_id, player_name, team_abbr, status, injury_detail, updated_at)
-                                VALUES (%s, %s, %s, %s, %s, %s)
-                                ON CONFLICT (player_id) DO UPDATE SET
-                                    player_name = EXCLUDED.player_name,
-                                    team_abbr = EXCLUDED.team_abbr,
-                                    status = EXCLUDED.status,
-                                    injury_detail = EXCLUDED.injury_detail,
-                                    updated_at = EXCLUDED.updated_at
-                            """, (pid, player_name, team_abbr, status, reason, now))
-                            count += 1
-            except Exception as e:
-                logger.debug(f"[NBACollector] Official injury report error: {e}")
+                # Team abbreviation resolution
+                team_lower = (e.get("team_name", "") or "").lower()
+                team_abbr = ""
+                for key, abbr in TEAM_NAME_TO_ABBR.items():
+                    if key in team_lower:
+                        team_abbr = abbr
+                        break
+
+                # Compose injury_detail: body_part + detail + return_date + source tag
+                parts = []
+                if e.get("body_part"):
+                    parts.append(e["body_part"])
+                if e.get("detail"):
+                    parts.append(e["detail"])
+                if e.get("return_date"):
+                    parts.append(f"return={e['return_date']}")
+                parts.append(f"[src={source}]")
+                injury_detail = " | ".join(parts)
+
+                try:
+                    cur.execute("""
+                        INSERT INTO nba_injuries
+                        (player_id, player_name, team_abbr, status, injury_detail, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (player_id) DO UPDATE SET
+                            player_name = EXCLUDED.player_name,
+                            team_abbr = EXCLUDED.team_abbr,
+                            status = EXCLUDED.status,
+                            injury_detail = EXCLUDED.injury_detail,
+                            updated_at = EXCLUDED.updated_at
+                    """, (pid, pname, team_abbr, e.get("status", "Unknown"), injury_detail, now))
+                    count += 1
+                except Exception as ie:
+                    logger.debug(f"[Injury] DB insert failed for {pname}: {ie}")
 
             self.conn.commit()
-            logger.info(f"[NBACollector] Collected {count} injury reports")
+
+            # Persist successful fetch to cache (not re-cache if we pulled from cache)
+            if source != "cache":
+                _save_injury_cache(entries, source)
+
+            logger.info(f"[NBACollector] Collected {count} injury reports (source={source})")
             return count
 
         except Exception as e:
-            logger.error(f"[NBACollector] Error collecting injuries: {e}")
+            logger.error(f"[NBACollector] Error writing injuries: {e}")
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
             return 0
+
+    def _fetch_nba_official_injuries(self) -> List[dict]:
+        """Existing official.nba.com source (wrapped to match new entry format)."""
+        url = "https://official.nba.com/wp-json/api/v1/injury-report"
+        r = _http_get_with_retry(url)
+        if not r:
+            return []
+        try:
+            data = r.json()
+        except Exception:
+            return []
+        out = []
+        for item in (data if isinstance(data, list) else data.get("data", [])):
+            pname = item.get("player", item.get("Player", ""))
+            if not pname:
+                continue
+            out.append({
+                "player_name": pname,
+                "team_name": item.get("team", item.get("Team", "")) or "",
+                "status": _normalize_injury_status(item.get("status", item.get("Current Status", ""))),
+                "body_part": "",
+                "detail": item.get("reason", item.get("Reason", "")) or "",
+                "return_date": "",
+            })
+        return out
 
     # ----------------------------------------------------------------
     # Schedule & B2B Detection
@@ -893,7 +1163,7 @@ class NBADataCollector:
             "games": 0,
         }
 
-        summary["recent_form"] = self.collect_all_recent_form(top_n=80)
+        summary["recent_form"] = self.collect_all_recent_form(top_n=120)
         summary["injuries"] = self.collect_injuries()
         summary["games"] = self.collect_schedule(days_ahead=2)
 

@@ -594,6 +594,13 @@ class NBADataCollector:
         """
         Collect recent form for top N players (by minutes played).
         Rate-limited: ~1 request per second.
+
+        Two passes:
+          1. First pass: top N by minutes_pg × games_played DESC (existing behavior)
+          2. Guaranteed pass: for each team playing in next 3 days (nba_games),
+             take top 8 HEALTHY (not Out/DTD/Questionable) by minutes_pg and
+             fetch R5 if missing. Covers injured-returning stars (low GP,
+             high MIN) that fall below healthy bench players in the first sort.
         """
         cur = self.conn.cursor()
         cur.execute("""
@@ -603,6 +610,7 @@ class NBADataCollector:
             LIMIT %s
         """, (self.season, top_n))
         players = cur.fetchall()
+        first_pass_ids = set(p[0] for p in players)
 
         count = 0
         total = len(players)
@@ -612,8 +620,139 @@ class NBADataCollector:
             if (i + 1) % 20 == 0:
                 logger.info(f"[NBACollector] Recent form: {i+1}/{total} players processed")
 
-        logger.info(f"[NBACollector] Collected recent form for {count}/{total} players")
+        logger.info(f"[NBACollector] Collected recent form for {count}/{total} players (first pass)")
+
+        # Second pass: Play-In / Playoff team healthy stars (graceful degradation)
+        try:
+            patched = self._collect_playoff_team_guaranteed(first_pass_ids)
+            if patched > 0:
+                count += patched
+                logger.info(f"[NBACollector] Guaranteed pass added {patched} players")
+        except Exception as e:
+            logger.warning(
+                f"[NBACollector] Guaranteed pass failed (first pass preserved): {e}"
+            )
+
         return count
+
+    def _collect_playoff_team_guaranteed(self, already_done_ids: set) -> int:
+        """Backfill R5 for Play-In/Playoff team healthy stars.
+
+        Selection:
+          1. Teams playing in the next 3 days (from nba_games)
+          2. Per team: top 8 by minutes_pg DESC (NO games_played weight)
+          3. Skip: already in first_pass, injured (Out/DTD/Questionable/Doubtful),
+             R5 already populated
+          4. Rate-limit-aware retry (2s backoff, 1 retry on 429-like failure)
+        """
+        cur = self.conn.cursor()
+
+        # STEP A: teams with games in next 3 days
+        cur.execute("""
+            SELECT DISTINCT team_abbr
+            FROM (
+                SELECT home_team_abbr AS team_abbr FROM nba_games
+                WHERE game_date::date >= CURRENT_DATE
+                  AND game_date::date <= CURRENT_DATE + INTERVAL '3 days'
+                UNION
+                SELECT away_team_abbr FROM nba_games
+                WHERE game_date::date >= CURRENT_DATE
+                  AND game_date::date <= CURRENT_DATE + INTERVAL '3 days'
+            ) t
+            WHERE team_abbr IS NOT NULL AND team_abbr != ''
+        """)
+        teams = [r[0] for r in cur.fetchall()]
+        if not teams:
+            logger.info("[guaranteed_patch] No upcoming games in next 3 days — skip")
+            return 0
+        logger.info(f"[guaranteed_patch] Upcoming teams ({len(teams)}): {sorted(teams)}")
+
+        # STEP B: injury set (unicode-normalized names) — exclude these
+        cur.execute("SELECT player_name, status FROM nba_injuries")
+        INJURY_KEYS = ("out", "doubtful", "day-to-day", "day to day", "dtd", "questionable")
+        injured_names = set()
+        for row in cur.fetchall():
+            pname, status = row
+            if not pname or not status:
+                continue
+            if any(k in status.lower() for k in INJURY_KEYS):
+                injured_names.add(_normalize_player_name(pname))
+
+        # STEP C + D: per-team top 8 healthy, R5 missing only
+        patched = []
+        skipped = {"first_pass": 0, "r5_present": 0, "injured": 0}
+
+        for team in teams:
+            cur.execute("""
+                SELECT player_id, player_name, minutes_pg, games_played,
+                       COALESCE(recent5_pts_avg, 0),
+                       COALESCE(recent5_reb_avg, 0),
+                       COALESCE(recent5_ast_avg, 0)
+                FROM nba_players
+                WHERE season = %s AND team_abbr = %s AND games_played >= 3
+                ORDER BY minutes_pg DESC
+                LIMIT 16
+            """, (self.season, team))
+            candidates = cur.fetchall()
+
+            added_for_team = 0
+            for pid, name, mpg, gp, r5_p, r5_r, r5_a in candidates:
+                if added_for_team >= 8:
+                    break
+
+                if pid in already_done_ids:
+                    skipped["first_pass"] += 1
+                    added_for_team += 1  # counts toward team coverage
+                    continue
+
+                if _normalize_player_name(name) in injured_names:
+                    skipped["injured"] += 1
+                    continue
+
+                if (r5_p or 0) > 0 or (r5_r or 0) > 0 or (r5_a or 0) > 0:
+                    skipped["r5_present"] += 1
+                    added_for_team += 1
+                    continue
+
+                # Fetch R5 with 1-retry rate-limit backoff
+                ok = False
+                for attempt in (1, 2):
+                    try:
+                        ok = self.collect_player_recent_form(pid)
+                        if ok:
+                            break
+                    except Exception as e:
+                        if attempt == 1 and "429" in str(e):
+                            logger.debug(f"[guaranteed_patch] 429 for {name}, backoff 2s")
+                            time.sleep(2.0)
+                            continue
+                        logger.debug(f"[guaranteed_patch] {name} failed: {e}")
+                        break
+
+                if ok:
+                    # Log before/after by re-reading the row
+                    cur.execute("""
+                        SELECT recent5_pts_avg, recent5_reb_avg, recent5_ast_avg
+                        FROM nba_players WHERE player_id = %s
+                    """, (pid,))
+                    after = cur.fetchone() or (0, 0, 0)
+                    logger.info(
+                        f"[guaranteed_patch] + {name} ({team}) "
+                        f"R5: pts {r5_p:.1f}->{after[0] or 0:.1f} | "
+                        f"reb {r5_r:.1f}->{after[1] or 0:.1f} | "
+                        f"ast {r5_a:.1f}->{after[2] or 0:.1f}"
+                    )
+                    patched.append(name)
+                    added_for_team += 1
+
+        logger.info(
+            f"[guaranteed_patch] Patched {len(patched)} players | "
+            f"skipped: first_pass={skipped['first_pass']}, "
+            f"r5_present={skipped['r5_present']}, injured={skipped['injured']}"
+        )
+        if patched:
+            logger.info(f"[guaranteed_patch] Names: {patched}")
+        return len(patched)
 
     # ----------------------------------------------------------------
     # Team Stats Collection

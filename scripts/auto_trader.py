@@ -140,7 +140,7 @@ FORCE_DRY_RUN = False
 # Only these prop types execute via Kalshi API (real money).
 # All other prop types remain paper-traded.
 # FORCE_DRY_RUN=True overrides this (everything stays paper).
-LIVE_PROP_TYPES = {"rebounds"}
+LIVE_PROP_TYPES = {"rebounds", "points", "assists"}
 MAX_OPEN_POSITIONS = 10
 
 # ============================================================================

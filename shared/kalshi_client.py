@@ -20,7 +20,7 @@ import base64
 import hashlib
 import logging
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Iterator
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 
@@ -370,6 +370,95 @@ class KalshiAPIClient:
         if status:
             params["settlement_status"] = status
         return self._request("GET", "/portfolio/positions", params=params)
+
+    def get_fills(
+        self,
+        ticker: str = None,
+        order_id: str = None,
+        min_ts: int = None,
+        max_ts: int = None,
+        limit: int = 200,
+        cursor: str = None,
+    ) -> dict:
+        """
+        GET /portfolio/fills — 체결된 거래 이력.
+        min_ts/max_ts는 Unix epoch seconds.
+        반환: {"fills": [...], "cursor": "..."}
+        """
+        params = {"limit": min(max(limit, 1), 1000)}
+        if ticker: params["ticker"] = ticker
+        if order_id: params["order_id"] = order_id
+        if min_ts is not None: params["min_ts"] = int(min_ts)
+        if max_ts is not None: params["max_ts"] = int(max_ts)
+        if cursor: params["cursor"] = cursor
+        return self._request("GET", "/portfolio/fills", params=params)
+
+    def get_settlements(
+        self,
+        ticker: str = None,
+        event_ticker: str = None,
+        min_ts: int = None,
+        max_ts: int = None,
+        limit: int = 200,
+        cursor: str = None,
+    ) -> dict:
+        """
+        GET /portfolio/settlements — 정산 완료된 마켓 이력 + 실현손익.
+        반환: {"settlements": [...], "cursor": "..."}
+        각 settlement: ticker, market_result(yes/no), yes_count, no_count, revenue, settled_time
+        """
+        params = {"limit": min(max(limit, 1), 1000)}
+        if ticker: params["ticker"] = ticker
+        if event_ticker: params["event_ticker"] = event_ticker
+        if min_ts is not None: params["min_ts"] = int(min_ts)
+        if max_ts is not None: params["max_ts"] = int(max_ts)
+        if cursor: params["cursor"] = cursor
+        return self._request("GET", "/portfolio/settlements", params=params)
+
+    def get_positions_raw(
+        self,
+        ticker: str = None,
+        event_ticker: str = None,
+        count_filter: str = None,
+        settlement_status: str = None,
+        limit: int = 200,
+        cursor: str = None,
+    ) -> dict:
+        """
+        GET /portfolio/positions — raw 응답 그대로.
+        기존 get_positions가 필드 drop시켜서 None 찍히는 문제 회피용.
+        count_filter 유효값: "position,total_traded" (comma-separated subset)
+        settlement_status: "all" | "settled" | "unsettled"
+        """
+        params = {"limit": min(max(limit, 1), 1000)}
+        if ticker: params["ticker"] = ticker
+        if event_ticker: params["event_ticker"] = event_ticker
+        if count_filter: params["count_filter"] = count_filter
+        if settlement_status: params["settlement_status"] = settlement_status
+        if cursor: params["cursor"] = cursor
+        return self._request("GET", "/portfolio/positions", params=params)
+
+    def paginate(self, method_name: str, **kwargs) -> list:
+        """
+        cursor 기반 페이지네이션 헬퍼. 모든 페이지 합쳐서 리스트 반환.
+        사용: client.paginate("get_fills", ticker="KXNBA...", limit=200)
+        반환: fills/settlements/positions의 평탄화된 list.
+        """
+        method = getattr(self, method_name)
+        results = []
+        cursor = None
+        max_pages = 20  # safety: 20 * 200 = 4000건
+        for _ in range(max_pages):
+            resp = method(cursor=cursor, **kwargs) if cursor else method(**kwargs)
+            # 키 자동 탐지
+            for key in ("fills", "settlements", "market_positions", "event_positions", "positions"):
+                if key in resp and isinstance(resp[key], list):
+                    results.extend(resp[key])
+                    break
+            cursor = resp.get("cursor")
+            if not cursor:
+                break
+        return results
 
     def create_order(
         self,

@@ -305,33 +305,10 @@ def scanner_loop(
 
 ET = ZoneInfo("US/Eastern")
 
+
 def _now_et() -> datetime:
-    """Current time in US/Eastern."""
+    """Current time in US/Eastern. Used for info display + NBA league-day reporting."""
     return datetime.now(ET)
-
-
-def _get_today_nba_schedule() -> list:
-    """
-    Returns sorted list of game tipoff times (UTC-aware datetime) for today (ET calendar date).
-    Returns [] on no games or API error.
-    """
-    try:
-        from nba_api.live.nba.endpoints import scoreboard
-        from dateutil.parser import parse as dtparse
-        data = scoreboard.ScoreBoard().get_dict()
-        games = data.get("scoreboard", {}).get("games", [])
-        times = []
-        for g in games:
-            t = g.get("gameTimeUTC")
-            if t:
-                dt = dtparse(t)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                times.append(dt)
-        return sorted(times)
-    except Exception as e:
-        logger.warning(f"[Schedule] NBA schedule check failed: {e}")
-        return []
 
 
 # ============================================================================
@@ -378,6 +355,12 @@ def run_scheduled_tasks():
     # 11:59 PM ET — Settle predictions (retry up to 3x on DB lock)
     if now.hour == 23 and now.minute >= 55 and not _settle_done_today:
         _settle_done_today = True
+        # Equity curve snapshot (Kalshi ground truth, runs regardless of settle outcome)
+        try:
+            save_equity_curve_point(_now_et().strftime("%Y-%m-%d"))
+            logger.info("[Schedule] Equity curve point saved.")
+        except Exception as _eq_err:
+            logger.error(f"[Schedule] Equity curve save failed: {_eq_err}")
         logger.info(f"[Scheduler] Settling predictions for {today_str} (11:59 PM ET)")
         from settle_predictions import settle
         max_retries = 3
@@ -527,58 +510,6 @@ def main():
         ],
     )
 
-    # ── NBA Schedule Gate ──────────────────────────────────────────────────
-    logger.info("[Schedule] Checking today's NBA schedule...")
-    game_times_utc = _get_today_nba_schedule()
-
-    if not game_times_utc:
-        logger.info("[Schedule] No NBA games today — skipping")
-        sys.exit(0)
-
-    first_tipoff = game_times_utc[0].astimezone(ET)
-    last_tipoff  = game_times_utc[-1].astimezone(ET)
-    start_at     = first_tipoff - timedelta(hours=2)
-    # NBA game avg ~2.5h; +1h settle buffer = last_tipoff + 3.5h
-    shutdown_at  = last_tipoff + timedelta(hours=3, minutes=30)
-    # Floor: 12:30 AM ET next day — ensures settle (11:59 PM) runs before player report
-    today_1230am_et = first_tipoff.replace(hour=0, minute=30, second=0, microsecond=0) + timedelta(days=1)
-    shutdown_at = max(shutdown_at, today_1230am_et)
-
-    now_et = _now_et()
-    logger.info(
-        f"[Schedule] {len(game_times_utc)} NBA game(s) today | "
-        f"First tip: {first_tipoff.strftime('%I:%M %p ET')} | "
-        f"Window: {start_at.strftime('%I:%M %p')} – {shutdown_at.strftime('%I:%M %p')} ET"
-    )
-
-    if now_et >= shutdown_at:
-        # Window already closed — sleep until next 4pm ET to block bat restart loop
-        next_start = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
-        if now_et >= next_start:
-            next_start += timedelta(days=1)
-        wait_secs = (next_start - now_et).total_seconds()
-        logger.info(
-            f"[Schedule] Today's window already closed ({shutdown_at.strftime('%I:%M %p ET')}). "
-            f"Sleeping until {next_start.strftime('%Y-%m-%d %I:%M %p ET')} ({wait_secs/3600:.1f}h)."
-        )
-        try:
-            while _now_et() < next_start:
-                time.sleep(60)
-        except KeyboardInterrupt:
-            pass
-        sys.exit(0)
-
-    if now_et < start_at:
-        wait_mins = (start_at - now_et).total_seconds() / 60
-        logger.info(f"[Schedule] {wait_mins:.0f}m until scan window opens. Waiting...")
-        try:
-            while _now_et() < start_at:
-                time.sleep(30)
-        except KeyboardInterrupt:
-            logger.info("[Schedule] Interrupted during wait. Exiting.")
-            sys.exit(0)
-        logger.info("[Schedule] Scan window opened. Starting.")
-    # ───────────────────────────────────────────────────────────────────────
 
     settlement_hours = 0 if args.no_settlement_filter else args.max_settlement_hours
     auto_trade = not args.no_auto_trade and not args.observe_only
@@ -643,26 +574,11 @@ def main():
     _startup_catchup_forward_test()
 
     # Keep main thread alive — scheduled tasks + daily summary (all ET)
-    player_report_sent = False
     try:
         while not stop_event.is_set():
             stop_event.wait(timeout=60)
             run_scheduled_tasks()        # 12pm forward test, 11:59pm settle
             send_daily_summary_if_due()  # 10pm daily summary
-            if _now_et() >= shutdown_at:
-                if not player_report_sent:
-                    player_report_sent = True
-                    today_str_report = first_tipoff.strftime("%Y-%m-%d")
-                    logger.info("[Schedule] Saving equity curve point...")
-                    try:
-                        save_equity_curve_point(today_str_report)
-                    except Exception as _eq_err:
-                        logger.error(f"[Schedule] Equity curve save failed: {_eq_err}")
-                logger.info(
-                    f"[Schedule] Operating window closed "
-                    f"({shutdown_at.strftime('%I:%M %p ET')}). Shutting down."
-                )
-                stop_event.set()
     except KeyboardInterrupt:
         stop_event.set()
 

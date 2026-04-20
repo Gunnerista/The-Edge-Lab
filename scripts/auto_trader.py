@@ -187,6 +187,8 @@ class AutoTrader:
         self._traded_tickers: set = set()
 
         # Fix 5: Load existing position tickers to prevent duplicate orders on restart
+        self.settlement_ledger_path = Path(__file__).resolve().parent.parent / "data" / "settlement_ledger.jsonl"
+        self._ledger_tickers_cache = None  # lazy-loaded set of processed tickers
         self._load_existing_positions()
 
     # ----------------------------------------------------------------
@@ -255,6 +257,13 @@ class AutoTrader:
         # Wrap the full cycle body so a CircuitBreakerException raised deep
         # inside record_result() triggers auto-engagement of kill_switch.
         try:
+            # Idempotent settlement check every cycle — catches Kalshi-settled
+            # markets that were missed during runner downtime or sleep.
+            try:
+                self.check_settlements()
+            except Exception as _e:
+                logger.warning(f"[Cycle] check_settlements failed: {_e}")
+
             return self._run_cycle_body(results)
         except BankruptcyException as e:
             logger.critical(f"[CIRCUIT BREAKER / BANKRUPTCY] {e}")
@@ -648,66 +657,161 @@ class AutoTrader:
 
         self._pending_orders = still_pending
 
-    def check_settlements(self):
-        """Check if any positions have settled and log results."""
-        positions = self.trade_engine.positions.get_positions()
-        for pos in positions:
-            ticker = pos.get("ticker", "")
+    def _load_ledger_tickers(self):
+        """Lazy-load processed ticker set from ledger file."""
+        if self._ledger_tickers_cache is not None:
+            return self._ledger_tickers_cache
+        processed = set()
+        if self.settlement_ledger_path.exists():
             try:
-                market_data = self.client.get_market(ticker)
-                market = market_data.get("market", market_data)
-                result = market.get("result", "")
+                with open(self.settlement_ledger_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            entry = json.loads(line)
+                            t = entry.get("ticker")
+                            if t:
+                                processed.add(t)
+                        except Exception:
+                            pass
+            except Exception as e:
+                logger.warning(f"[Ledger] Failed to load {self.settlement_ledger_path}: {e}")
+        self._ledger_tickers_cache = processed
+        logger.info(f"[Ledger] Loaded {len(processed)} prior settlements from ledger")
+        return processed
 
-                if result in ("yes", "no"):
-                    entry = pos["avg_entry_price"]
-                    side = pos["side"]
-                    count = pos["count"]
+    def _append_ledger(self, entry: dict):
+        """Append one settlement record to ledger and update cache."""
+        try:
+            self.settlement_ledger_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.settlement_ledger_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, default=str) + "\n")
+            if self._ledger_tickers_cache is not None:
+                self._ledger_tickers_cache.add(entry["ticker"])
+        except Exception as e:
+            logger.error(f"[Ledger] APPEND FAILED for {entry.get('ticker')}: {e}")
 
-                    if (side == "yes" and result == "yes") or (side == "no" and result == "no"):
-                        # Win
-                        gross = (1 - entry) * count
-                        fee = gross * KALSHI_FEE_RATE
-                        pnl = gross - fee
-                        self.learn.trade_exited(
-                            ticker, side, entry, 1.0, count, pnl, "settled:win"
-                        )
-                    else:
-                        # Loss
-                        pnl = -entry * count
-                        self.learn.trade_exited(
-                            ticker, side, entry, 0.0, count, pnl, "settled:loss"
-                        )
-                        self.learn.trade_wrong(
-                            ticker, side, entry, 0.0, pnl,
-                            f"Market settled {result}, we held {side}",
-                            "Review signal quality for this market type",
-                        )
+    def check_settlements(self):
+        """
+        Idempotent settlement check. Kalshi API is ground truth.
+        Skips tickers already recorded in settlement_ledger.jsonl.
+        Called every cycle from run_cycle.
+        """
+        from datetime import datetime, timezone, timedelta
 
-                    # Brier Score + Calibration (auto trades only)
-                    sig_type = pos.get("signal_type", "")
-                    if sig_type and sig_type != "manual" and sig_type != "synced_from_kalshi":
-                        model_prob_val = pos.get("avg_entry_price", 0.5)
-                        outcome = 1.0 if pnl > 0 else 0.0
-                        brier = (model_prob_val - outcome) ** 2
-                        self.learn._write({
-                            "type": "brier_score",
-                            "ticker": ticker,
-                            "model_prob": round(model_prob_val, 4),
-                            "outcome": outcome,
-                            "score": round(brier, 4),
-                            "pnl": round(pnl, 2),
-                            "source": "live",
-                        })
-                        self.calibration.record(model_prob_val, int(outcome), ticker=ticker)
+        processed = self._load_ledger_tickers()
 
-                    # Record safety result
-                    self.safety.record_result(pnl > 0, pnl)
+        # Query Kalshi for recent settlements (last 48h window, idempotent-safe)
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        min_ts = now_ts - 48 * 3600
+        try:
+            settlements = self.client.paginate(
+                "get_settlements", min_ts=min_ts, max_ts=now_ts, limit=200
+            )
+        except Exception as e:
+            logger.warning(f"[Settlements] Kalshi API query failed: {e}")
+            return
 
-                    # Remove position
-                    self.trade_engine.positions.reduce_position(ticker, side, count)
+        new_count = 0
+        for s in settlements:
+            ticker = s.get("ticker")
+            if not ticker or ticker in processed:
+                continue
+
+            try:
+                result = s.get("market_result", "")  # "yes" | "no"
+                revenue_cents = s.get("revenue", 0) or 0
+                revenue = revenue_cents / 100.0
+                settled_time = s.get("settled_time", "")
+
+                # Match against local position for entry/side/count context
+                local_pos = None
+                for p in self.trade_engine.positions.get_positions():
+                    if p.get("ticker") == ticker:
+                        local_pos = p
+                        break
+
+                if local_pos:
+                    entry = local_pos.get("avg_entry_price", 0.5)
+                    side = local_pos.get("side", "yes")
+                    count = local_pos.get("count", 0)
+                    sig_type = local_pos.get("signal_type", "")
+                else:
+                    # No local position (maybe cleared already) — derive from Kalshi
+                    entry = 0.5  # unknown
+                    side = "yes"  # default assumption
+                    count = 0
+                    sig_type = "kalshi_only"
+
+                # PnL: use existing formula for Brier continuity
+                if (side == "yes" and result == "yes") or (side == "no" and result == "no"):
+                    gross = (1 - entry) * count if count else revenue
+                    fee = gross * KALSHI_FEE_RATE
+                    pnl = gross - fee
+                    exit_reason = "settled:win"
+                    self.learn.trade_exited(ticker, side, entry, 1.0, count, pnl, exit_reason)
+                else:
+                    pnl = -entry * count if count else -revenue  # edge case
+                    exit_reason = "settled:loss"
+                    self.learn.trade_exited(ticker, side, entry, 0.0, count, pnl, exit_reason)
+                    self.learn.trade_wrong(
+                        ticker, side, entry, 0.0, pnl,
+                        f"Market settled {result}, we held {side}",
+                        "Review signal quality for this market type",
+                    )
+
+                # Brier + Calibration (auto trades only, has local context)
+                if local_pos and sig_type and sig_type not in ("manual", "synced_from_kalshi", "kalshi_only"):
+                    outcome = 1.0 if pnl > 0 else 0.0
+                    brier = (entry - outcome) ** 2
+                    self.learn._write({
+                        "type": "brier_score",
+                        "ticker": ticker,
+                        "model_prob": round(entry, 4),
+                        "outcome": outcome,
+                        "score": round(brier, 4),
+                        "pnl": round(pnl, 2),
+                        "source": "live",
+                    })
+                    self.calibration.record(entry, int(outcome), ticker=ticker)
+
+                # Bankroll update via safety
+                self.safety.record_result(pnl > 0, pnl)
+
+                # Local position cleanup
+                if local_pos and count > 0:
+                    try:
+                        self.trade_engine.positions.reduce_position(ticker, side, count)
+                    except Exception as e:
+                        logger.warning(f"[Settlements] reduce_position failed for {ticker}: {e}")
+
+                # Ledger append (idempotency guarantee)
+                self._append_ledger({
+                    "ticker": ticker,
+                    "settled_time": settled_time,
+                    "market_result": result,
+                    "revenue_dollars": round(revenue, 4),
+                    "entry_price": round(entry, 4),
+                    "count": count,
+                    "side": side,
+                    "pnl": round(pnl, 2),
+                    "sig_type": sig_type,
+                    "recorded_at": datetime.now(timezone.utc).isoformat(),
+                    "source": "check_settlements_cycle",
+                })
+                new_count += 1
+                logger.info(
+                    f"[Settlements] {ticker} settled {result} | "
+                    f"pnl=${pnl:+.2f} | revenue=${revenue:.2f}"
+                )
 
             except Exception as e:
-                logger.debug(f"Settlement check error for {ticker}: {e}")
+                logger.warning(f"[Settlements] Processing error for {ticker}: {e}")
+
+        if new_count > 0:
+            logger.info(f"[Settlements] Processed {new_count} new settlement(s) this cycle")
 
     # ----------------------------------------------------------------
     # Exit Monitor: Mid-Trade Exit Strategy

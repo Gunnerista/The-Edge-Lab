@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.env
+.env.local
+!.env.example
+*.pem
+*.key
+data/
+logs/
+.venv/
+.pytest_cache/
+.coverage
+*.bak_*

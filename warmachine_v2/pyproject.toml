@@ -1,0 +1,18 @@
+[project]
+name = "warmachine"
+version = "0.0.0"
+description = "War Machine v2 - 110pt rebuild"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/unit", "tests/integration"]
+pythonpath = ["src"]
+markers = [
+    "integration: requires live PostgreSQL + Kalshi credentials",
+]

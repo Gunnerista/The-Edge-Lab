@@ -1,0 +1,47 @@
+# WarMachine v2 settings. Override via env vars or .env file.
+# Env format: WM_<SECTION>__<FIELD> (double underscore = nesting)
+
+[runtime]
+mode = "paper"                      # paper | live
+poll_interval_seconds = 60
+max_markets_per_cycle = 50
+
+[trading]
+global_min_edge_pp = 15.0
+yes_edge_premium_pp = 5.0
+max_edge_cap_pp = 60.0
+
+[trading.kelly]
+fractional_multiplier = 0.25
+single_trade_cap_pct = 0.03
+min_contracts = 1
+
+[paper]
+initial_balance_cents = 28061
+slippage_cents = 1
+
+[risk.exposure]
+per_ticker_pct = 0.03
+per_game_pct = 0.08
+per_player_pct = 0.05
+per_prop_type_daily_pct = 0.15
+total_open_pct = 0.30
+
+[risk.bankruptcy]
+floor_dollars = 100.0
+cooldown_days = 14
+
+[paths]
+data_dir = "data"
+state_file = "data/v2_session_state.json"
+clv_log = "data/v2_clv_log.jsonl"
+paper_state = "data/v2_paper_state.json"
+kill_switch = "data/STOP"
+heartbeat = "data/v2_heartbeat.txt"
+
+[database]
+host = "localhost"
+port = 5432
+dbname = "warmachine"
+user = "postgres"
+# password from env: WM_DATABASE__PASSWORD

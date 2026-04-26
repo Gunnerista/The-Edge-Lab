@@ -58,6 +58,18 @@ Chapter 4 covers the v5 transition, the live deployment, and the bugs that surfa
 
 ---
 
+## 2026-04-26 — Phase One closure
+
+### E5 · README — Phase One closure and metrics removal
+
+**Claim in previous README (pre-2026-04-26):** `STATUS: LIVE · PHASE 1 of 3 · POSITIVE EV ONLY` with a metrics table dated 2026-04-09 (`Total settled predictions: 1,660; Live capital deployed: $63.76`).
+
+**Correction:** The system continued running through April 24, 2026, then paused. The previous README's status badges and metrics table were not updated through the closing weeks of Phase One and reflected an inaccurately stale picture. The README has been rewritten to reflect Phase One's pause and to remove the metrics table — those numbers had become a source of misleading point-in-time figures rather than current state. Chapter 5 explains why a single summary P&L figure is not published.
+
+Also removed: a personal-bio section in the previous README. That section was unrelated to the project's technical content and added noise to the public narrative.
+
+---
+
 ## Policy
 
 - Chapters are append-only. The original prose is never edited. Errata boxes are added on top.

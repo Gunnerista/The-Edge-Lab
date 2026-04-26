@@ -246,4 +246,4 @@ Status going into next week: live, monitored, and a little more humble than last
 
 ---
 
-[← Previous: Chapter 3 — The Price Was Wrong](./2026-04-04-the-price-was-wrong.md) | [Next: TBD →]
+[← Previous: Chapter 3 — The Price Was Wrong](./2026-04-04-the-price-was-wrong.md) | [Next: Chapter 5 — Closing the Books on Phase One →](./2026-04-26-closing-the-books.md)

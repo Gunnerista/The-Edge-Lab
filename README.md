@@ -1,80 +1,73 @@
-<h1 align="center">THE EDGE LAB</h1>
+# Kalshi NBA Player Props
 
-<p align="center">
-  <strong>Building automated trading systems for prediction markets — in public, with receipts.</strong>
-</p>
+A first side project, started for the wrong reasons and finished for the right ones.
 
-<p align="center">
-  <em>NBA player props on Kalshi · XGBoost + Platt calibration · Kelly sizing · PostgreSQL</em>
-</p>
+Some friends and I had been trading small NBA player props on Kalshi for fun — five-dollar
+bets to make the games more interesting. One evening I started wondering whether
+something more disciplined than "guess and click" could actually find edge in those
+markets, and whether I could build it myself.
 
-<p align="center">
-  <code>STATUS: LIVE</code> · <code>PHASE 1 of 3</code> · <code>POSITIVE EV ONLY</code>
-</p>
+It turned into a thirty-day experiment. Vibe coded nights and weekends, deployed to
+live capital for a month, and now paused. This repository is the public log — five
+chapters of real-time engineering notes, plus errata when I had to correct myself, plus
+a closing chapter on why the bottom-line P&L is not published.
 
----
-
-## What This Is
-
-The Edge Lab is the public log of an automated trading system I'm building for prediction markets — currently focused on NBA player rebounds on Kalshi.
-
-It's not a tutorial. It's not a course. It's a working system, documented as it evolves: every model rebuild, every bug, every losing trade, every uncomfortable lesson.
-
-The repo holds the **story** of the system. The system itself stays private — alpha decays the moment it's published.
-
-**The rules I trade by:**
-
-1. Never bet without an edge.
-2. Let the math decide, not the gut.
-3. Document everything — including the failures. Especially the failures.
-
----
-
-## Where The System Stands
-
-| Metric | Value | As of |
-|---|---|---|
-| Total settled predictions | 1,660 | 2026-04-09 |
-| Live capital deployed | $63.76 | 2026-04-09 |
-| Current model | XGBoost + Platt scaling | v5_kelly config |
-| Active prop type (live) | NBA Rebounds | Real money |
-| Active prop types (paper) | Points, Assists | Validation only |
-| Database | PostgreSQL (`warmachine`) | Migrated from SQLite |
-| Schedule | Daily, NBA-aware cron | Windows Task Scheduler |
-
-Numbers update as the system runs. They are not all flattering. That's the point.
-
----
-
-## Mission Log
-
-The chronological story of the system. Each entry is a snapshot in time — they are not edited after the fact. When something turns out to be wrong, an errata box goes on top of the original and a full record lives in [`ERRATA.md`](./ERRATA.md).
-
-| Date | Ch | Title | Outcome |
-|---|---|---|---|
-| 2026-03-28 | 1 | [System Audit & XGBoost Migration](./logs/2026-03-28-system-audit.md) | SQLite → PostgreSQL, logistic → XGBoost, Brier ↓ |
-| 2026-04-02 | 2 | [Phase 1 Validation](./logs/2026-04-02-phase1-validation.md) | 999 predictions audited, edge by prop type isolated |
-| 2026-04-04 | 3 | [The Price Was Wrong](./logs/2026-04-04-the-price-was-wrong.md) | Entry-price bug exposed, v3 → v4 config rebuild |
-| 2026-04-09 | 4 | [Three Days, Four Bugs, One Repo Sanitized](./logs/2026-04-09-three-days-four-bugs.md) | Live transition, zero-padding bug, public IP audit, gap discovery |
+The trading code itself is private. The chapters and lessons are public.
 
 ---
 
 ## Tech Stack
 
-Python 3.11+ · XGBoost · Platt scaling · PostgreSQL · Kalshi API · `nba_api` · Kelly criterion (quarter-fraction)
+Python 3.11 · XGBoost · Platt scaling · PostgreSQL · Kalshi REST and WebSocket APIs · `nba_api` · Kelly criterion (quarter-fraction sizing).
 
-Code is private. Decisions, results, and lessons are public.
+The trading code is not in this repository — only the public narrative.
 
 ---
 
-## About
+## Project Snapshot
 
-Built by **Ikjun Jang** — sports agency director by day, prediction-market quant by night.
+| Item | Value |
+|---|---|
+| Phase | Phase One — paused |
+| Project window | 2026-03-25 → 2026-04-24 |
+| Live capital phase | 2026-04-05 → 2026-04-24 (20 days) |
+| Settled predictions | 1,660+ |
+| Live trades placed | ~30 |
+| Active prop type (live) | NBA Rebounds |
+| Other props | Paper-only validation (Points, Assists) |
+| Final config | `v5_kelly` (quarter-Kelly, 5% bankroll cap) |
+| Database | PostgreSQL |
+| System status | Runner offline, API key revoked |
 
-🏢 Director @ L&K Agency (player transfers, club sponsorships, sports M&A)  
-🎓 Duke MMS:FOB '27 (incoming, July 2026)  
-⚽ Arsenal supporter  
+Final P&L is not published. Chapter 5 explains the reasoning.
 
-> *"The edge is in the work nobody sees. The point of writing it down is to make sure I keep doing it."*
+---
 
-**Started:** March 28, 2026 · **Updated:** as the system runs · **Built in public**
+## Log
+
+Each entry is a snapshot in time and is not edited after the fact. Corrections appear
+as errata boxes on the affected chapter, with the full record in [`ERRATA.md`](./ERRATA.md).
+
+| Date | Ch | Title | Outcome |
+|---|---|---|---|
+| 2026-03-28 | 1 | [System Audit & XGBoost Migration](./logs/2026-03-28-system-audit.md) | SQLite → PostgreSQL, logistic → XGBoost |
+| 2026-04-02 | 2 | [Phase 1 Validation](./logs/2026-04-02-phase1-validation.md) | 999 predictions audited |
+| 2026-04-04 | 3 | [The Price Was Wrong](./logs/2026-04-04-the-price-was-wrong.md) | Entry-price bug, v3 → v4 rebuild |
+| 2026-04-09 | 4 | [Three Days, Four Bugs, One Repo Sanitized](./logs/2026-04-09-three-days-four-bugs.md) | Live transition, gap discovery |
+| 2026-04-26 | 5 | [Closing the Books on Phase One](./logs/2026-04-26-closing-the-books.md) | End of live phase |
+
+---
+
+## Lessons (Short Version)
+
+Expanded in Chapter 5:
+
+- A calibrated probability model is necessary but not sufficient. Pipeline reliability is
+  load-bearing and gets attention only after it breaks.
+- Edge thresholds matter more than model improvements. Below ~15% edge, fees dominate.
+- Different prop types have different efficiency. Rebounds had real edge in this window;
+  points and assists did not at the thresholds tested.
+- Quarter-fraction Kelly with a hard bankroll cap survived variance in a way adaptive
+  sizing did not.
+- Silent failures cost more than loud ones. The bugs that hurt this project never threw
+  exceptions.
